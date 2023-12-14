@@ -32,6 +32,25 @@ class Router extends Data
 
     private $GUID;
 
+
+    /**
+     * Add CORS headers to the response
+     * @param $headers
+     * @return mixed
+     */
+    final public function addCORS($headers) {
+        if (defined("TINA4_ALLOW_ORIGINS")) {
+            $headers[] = ('Access-Control-Allow-Origin: ' . implode(",", TINA4_ALLOW_ORIGINS));
+        }
+
+        $headers[] = ('Vary: Origin');
+        $headers[] = ('Access-Control-Allow-Methods: GET, PUT, POST, PATCH, DELETE, OPTIONS');
+        $headers[] = ('Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With');
+        $headers[] = ('Access-Control-Allow-Credentials: True');
+
+        return $headers;
+    }
+
     /**
      * Resolves to a route that is registered in code and returns the result from that code
      * @param string|null $method
@@ -54,11 +73,7 @@ class Router extends Data
         }
 
         $url = $this->cleanURL($url);
-        $cacheResult = $this->getCacheResponse($url);
-        if ($cacheResult !== null && $url !== "/cache/clear" && $url !== "/migrate" && $url !== "/migrate/create") {
-            Debug::message("$this->GUID Got cached result for $url", TINA4_LOG_DEBUG);
-            return new RouterResponse($cacheResult["content"], $cacheResult["httpCode"], $cacheResult["headers"]);
-        }
+
         Debug::message("$this->GUID {$method} - {$url}", TINA4_LOG_DEBUG);
         //Clean the URL
 
@@ -72,17 +87,13 @@ class Router extends Data
         }
 
         //SECOND STATIC FILES - ONLY GET
-
         if ($method === TINA4_GET) {
-
-
-            $fileName = realpath(TINA4_DOCUMENT_ROOT . PATH_SEPARATOR."src".PATH_SEPARATOR."public".$url); //The most obvious request
+            $fileName = realpath(TINA4_DOCUMENT_ROOT . DIRECTORY_SEPARATOR . "src" . DIRECTORY_SEPARATOR . "public" . $url); //The most obvious request
             if (file_exists($fileName) && $routerResponse = $this->returnStatic($fileName)) {
                 Debug::message("$this->GUID GET - " . $fileName, TINA4_LOG_DEBUG);
-                if (defined("TINA4_CACHED_ROUTES") && strpos(print_r(TINA4_CACHED_ROUTES, 1), $url) !== false) {
-                    $this->createCacheResponse($url, $routerResponse->httpCode, $routerResponse->content, $routerResponse->headers, $fileName);
+                if (!empty($routerResponse->content)) {
+                    return $routerResponse;
                 }
-                return $routerResponse;
             }
         }
 
@@ -96,8 +107,15 @@ class Router extends Data
 
         //THIRD ROUTING
         if ($routerResponse = $this->handleRoutes($method, $url, $customHeaders, $customRequest)) {
-            if (defined("TINA4_CACHED_ROUTES") && strpos(print_r(TINA4_CACHED_ROUTES, 1), $url) !== false) {
-                $this->createCacheResponse($url, $routerResponse->httpCode, $routerResponse->content, $routerResponse->headers, "");
+            if ($routerResponse->cached) {
+                $this->createCacheResponse(
+                    $url.$method,
+                    $routerResponse->httpCode,
+                    $routerResponse->content,
+                    $this->addCORS($routerResponse->headers),
+                    "",
+                    $routerResponse->contentType
+                );
             }
             return $routerResponse;
         }
@@ -119,28 +137,15 @@ class Router extends Data
             }
         }
 
-        $this->createCacheResponse($url, $parseFile->httpCode, $parseFile->content, $parseFile->headers, $parseFile->fileName);
-        return new RouterResponse($parseFile->content, $parseFile->httpCode, $parseFile->headers);
-    }
-
-    /**
-     * Get cache response
-     * @param $url
-     * @return array|null
-     * @throws \Phpfastcache\Exceptions\PhpfastcacheInvalidArgumentException
-     * @throws \Psr\Cache\InvalidArgumentException
-     */
-    public function getCacheResponse($url): ?array
-    {
-        $key = "url_" . md5($url);
-
-        $response = (new Cache())->get($key);
-        if (defined("TINA4_DEBUG") && TINA4_DEBUG && $response !== null && (strpos($response["fileName"], ".twig") !== false || strpos($response["fileName"], "/public/") !== false)) {
-            return null;
+        //Caching of templates
+        if (defined("TINA4_CACHE_ON") && TINA4_CACHE_ON) {
+            $this->createCacheResponse($url, $parseFile->httpCode, $parseFile->content, $this->addCORS($parseFile->headers), $parseFile->fileName, TEXT_HTML);
         }
 
-        return $response;
+        return new RouterResponse($parseFile->content, $parseFile->httpCode, $this->addCORS($parseFile->headers));
     }
+
+
 
     /**
      * Handles an options request
@@ -155,16 +160,8 @@ class Router extends Data
 
         $headers = [];
         if (in_array("*", TINA4_ALLOW_ORIGINS) || (array_key_exists("HTTP_ORIGIN", $_SERVER) && in_array($_SERVER["HTTP_ORIGIN"], TINA4_ALLOW_ORIGINS))) {
-            if (array_key_exists("HTTP_ORIGIN", $_SERVER)) {
-                $headers[] = ('Access-Control-Allow-Origin: ' . $_SERVER["HTTP_ORIGIN"]);
-            } else {
-                $headers[] = ('Access-Control-Allow-Origin: ' . implode(",", TINA4_ALLOW_ORIGINS));
-            }
+            $headers = $this->addCORS($headers);
             $headers[] = ('Tina4-Debug: '.$this->GUID);
-            $headers[] = ('Vary: Origin');
-            $headers[] = ('Access-Control-Allow-Methods: GET, PUT, POST, PATCH, DELETE, OPTIONS');
-            $headers[] = ('Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With');
-            $headers[] = ('Access-Control-Allow-Credentials: true');
             $httpCode = HTTP_OK;
         } else {
             $httpCode = HTTP_METHOD_NOT_ALLOWED;
@@ -192,16 +189,17 @@ class Router extends Data
 
         $headers[] = ('Content-Type: ' . $mimeType);
         $headers[] = ('Tina4-Debug: '.$this->GUID);
-        $headers[] = ('Cache-Control: max-age=' . (60 * 60) . ', public');
-        $headers[] = ('Expires: ' . gmdate('D, d M Y H:i:s \G\M\T', time() + (60 * 60))); //1 hour expiry time
+        $headers[] = ('Cache-Control: max-age=' . (60 * 60 * 60) . ', public');
+        $headers[] = ('Expires: ' . gmdate('D, d M Y H:i:s \G\M\T', time() + (60 * 60 * 60))); //60 hour expiry time
+        $headers[] = ('Pragma: cache');
+
 
         $ext = pathinfo($fileName, PATHINFO_EXTENSION);
         if ($ext !== "twig") {
             $content = file_get_contents($fileName);
-        } else {
-            $content = renderTemplate($fileName);
         }
-        return new RouterResponse($content, HTTP_OK, $headers);
+
+        return new RouterResponse($content, HTTP_OK, $headers, false, $mimeType);
     }
 
     /**
@@ -305,18 +303,77 @@ class Router extends Data
      * @param $content
      * @param $headers
      * @param $fileName
+     * @param $contentType
      * @return bool
-     * @throws PhpfastcacheInvalidArgumentException
      * @throws InvalidArgumentException
+     * @throws PhpfastcacheInvalidArgumentException
      */
-    public function createCacheResponse($url, $httpCode, $content, $headers, $fileName): bool
+    public function createCacheResponse($url, $httpCode, $content, $headers, $fileName, $contentType): bool
     {
         global $cache;
+        if (empty($cache)) {
+            $cache = createCache();
+        }
+
         $key = "url_" . md5($url);
         if (defined("TINA4_DEBUG") && TINA4_DEBUG && (strpos($url, ".twig") !== false || strpos($url, "/public/") !== false)) {
             return false;
         }
-        return (new Cache())->set($key, ["url" => $url, "fileName" => $fileName, "httpCode" => $httpCode, "content" => $content, "headers" => $headers], 360);
+        return (new Cache())->set($key, ["url" => $url, "fileName" => $fileName, "httpCode" => $httpCode, "content" => $content, "headers" => $headers, "contentType" => $contentType], 360);
+    }
+
+    /**
+     * Get cache response
+     * @param $url
+     * @return array|null
+     * @throws \Phpfastcache\Exceptions\PhpfastcacheInvalidArgumentException
+     * @throws \Psr\Cache\InvalidArgumentException
+     */
+    public function getCacheResponse($url): ?array
+    {
+        global  $cache;
+        if (empty($cache)) {
+            $cache = createCache();
+        }
+        $key = "url_" . md5($url);
+
+        $response = (new Cache())->get($key);
+        if (defined("TINA4_DEBUG") && TINA4_DEBUG && $response !== null && (strpos($response["fileName"], ".twig") !== false || strpos($response["fileName"], "/public/") !== false)) {
+            return null;
+        }
+
+        return $response;
+    }
+
+
+    /**
+     * Get all variations of X headers
+     * @param $headers
+     * @return array
+     */
+    function getXHeaders($headers): array
+    {
+        //regex for BLAH-X BLAH_X
+        $xHeaders = [];
+        foreach ($_SERVER as $headerName => $headerValue)
+        {
+            if (stripos($headerName, "X") !== false) {
+                $re = '/.*X[\_|\-](.*)/i';
+                preg_match_all($re, $headerName, $matches, PREG_SET_ORDER, 0);
+
+                if (count($matches) > 0)
+                {
+                    if (isset($matches[0][1]))
+                    {
+                        $headerName = str_replace("\r", "", str_replace("\n", "", $matches[0][1]));
+                        $xHeaders[] = "X-".$headerName.":".$headerValue;
+                        $xHeaders[] = "X_".$headerName.":".$headerValue;
+                    }
+
+                }
+            }
+        }
+        return array_merge($xHeaders, $headers);
     }
 
     /**
@@ -333,15 +390,22 @@ class Router extends Data
         Debug::message("$this->GUID Looking in routes for {$method} - {$url}", TINA4_LOG_DEBUG);
         global $arrRoutes;
         $response = new Response();
+
+        if ($this->config->getAuthentication() === null) {
+            $auth = new Auth();
+            $this->config->setAuthentication($auth);
+        }
+
         $headers = [];
         $headers[] = "Tina4Debug: $this->GUID";
+        $headers[] = "FreshToken: ".$this->config->getAuthentication()->getToken(["payload" => $url]);
+
         //iterate through the routes
 
         foreach ($arrRoutes as $rid => $route) {
             $result = null;
             Debug::message("$this->GUID Method match {$method} -> {$route["method"]}", TINA4_LOG_DEBUG);
             if (($route["method"] === $method || $route["method"] === TINA4_ANY) && $this->matchPath($url, $route["routePath"])) {
-                //Look to see if we are a secure route
                 if (!empty($route["class"])) {
                     $reflectionClass = new \ReflectionClass($route["class"]);
                     $reflection = $reflectionClass->getMethod($route["function"]);
@@ -349,10 +413,63 @@ class Router extends Data
                     $reflection = new  \ReflectionFunction($route["function"]);
                 }
 
+                //Get the annotations for the route
                 $doc = $reflection->getDocComment();
-                preg_match_all('#@(.*?)(\r\n|\n)#s', $doc, $annotations);
+                $annotations = (new Annotation())->parseAnnotations($doc, "");
 
                 $params = $this->getParams($response, $route["inlineParamsToRequest"], $customRequest);
+
+                //Check for middle ware and pass params to the middle ware for processing
+                if (isset($annotations["middleware"])) {
+                    $route["middleware"] = explode(",", $annotations["middleware"][0]);
+                }
+
+                //Check for no-cache
+                if (isset($annotations["no-cache"])) {
+                    $route["cached"] = false;
+                }
+
+                //Check for cache annotation
+                if (isset($annotations["cache"])) {
+                    $route["cached"] = true;
+                }
+
+                //Determine the content type
+                if (isset($annotations["content-type"])) {
+                    $route["content-type"] = $annotations["content-type"][0];
+                } else {
+                    $route["content-type"] = TEXT_HTML;
+                }
+
+                if (!isset($route["cached"])) {
+                    if (defined("TINA4_CACHE_ON") && TINA4_CACHE_ON ) {
+                        $route["cached"] = true;
+                    } else {
+                        $route["cached"] = false;
+                    }
+                }
+
+
+                if (isset($annotations["secure"]) || isset($annotations["security"])) {
+                    $params[sizeof($params)-1]->security = isset($annotations["secure"]) ? explode(",", $annotations["secure"][0]) : explode(",", $annotations["security"][0]);
+                    if (empty($params[sizeof($params)-1]->security[0])) {
+                        $params[sizeof($params)-1]->security[0] = "user";
+                    }
+                }
+
+                if (isset($route["middleware"])) {
+                    global $arrMiddleware;
+                    foreach ($route["middleware"] as $middleware) {
+                        if (isset($arrMiddleware[Middleware::getName($middleware)])) {
+                            \Tina4\Debug::message("Executing " . $middleware);
+                            $response = $arrMiddleware[Middleware::getName($middleware)]["function"](...$params);
+                            if (!empty($response)) {
+                                $result = $response;
+                                break;
+                            }
+                        }
+                    }
+                }
 
                 if (function_exists("getallheaders")) {
                     $requestHeaders = getallheaders();
@@ -360,12 +477,8 @@ class Router extends Data
                     $requestHeaders = $customHeaders;
                 }
 
-                if (in_array("secure", $annotations[1], true) || (isset($requestHeaders["Authorization"]) && stripos($requestHeaders["Authorization"], "bearer ") !== false)) {
-                    if ($this->config->getAuthentication() === null) {
-                        $auth = new Auth();
-                        $this->config->setAuthentication($auth);
-                    }
-
+                //Look to see if we are a secure route
+                if (empty($result) && isset($annotations["secure"]) || empty($result) && (isset($requestHeaders["Authorization"]) && stripos($requestHeaders["Authorization"], "bearer ") !== false)) {
                     if (isset($requestHeaders["Authorization"]) && $this->config->getAuthentication()->validToken(urldecode($requestHeaders["Authorization"]))) {
                         //call closure with & without params
                         $this->config->setAuthentication(null); //clear the auth
@@ -375,23 +488,42 @@ class Router extends Data
                         //CRUD fix for built-in values of form & {id}
 
                         //Ensure the replaced '/form' is at the end of the route path when removing
-                        if(str_ends_with($route["routePath"], '/form')) {
+                        if(substr($route["routePath"], -5,5) == '/form') {
                             $route["routePath"] = substr_replace($route["routePath"], '', strrpos($route["routePath"], '/form'), 5);
                         }
 
                         $route["routePath"] = str_replace("/{id}", "", $route["routePath"]);
 
-                        if (isset($_REQUEST["formToken"]) && $route["method"] === TINA4_GET && $this->config->getAuthentication()->validToken($_REQUEST["formToken"])
-                            && $this->config->getAuthentication()->getPayLoad($_REQUEST["formToken"])["payload"] === $route["routePath"])
+                        if (isset($_REQUEST["formToken"]) && $route["method"] === TINA4_GET && $this->config->getAuthentication()->validToken($_REQUEST["formToken"]))
+                            // && $this->config->getAuthentication()->getPayLoad($_REQUEST["formToken"])["payload"] === $route["routePath"]) @todo fix this
                         {
                             \Tina4\Debug::message("$this->GUID Matching secure ".$this->config->getAuthentication()->getPayLoad($_REQUEST["formToken"])["payload"]." ".$route["routePath"], TINA4_LOG_DEBUG);
                             $this->config->setAuthentication(null); //clear the auth
+
                             $result = $this->getRouteResult($route["class"], $route["function"], $params);
                         } else {
                             if ($route["method"] === TINA4_GET) {
-                                return new RouterResponse("", HTTP_FORBIDDEN, $headers);
+                                if ($route["content-type"] === APPLICATION_JSON || $route["content-type"] === APPLICATION_XML) {
+                                    return new RouterResponse([], HTTP_FORBIDDEN, $headers, false, $route["content-type"]);
+                                } else {
+                                    return new RouterResponse("", HTTP_FORBIDDEN, $headers, false, $route["content-type"]);
+                                }
                             }
                         }
+                    }
+                }
+                  else
+                if ($route["cached"] && empty($result)) {
+                    $cacheResult = $this->getCacheResponse($url.$method);
+                    if ($cacheResult !== null && $url !== "/cache/clear" && $url !== "/migrate" && $url !== "/migrate/create") {
+                        Debug::message("$this->GUID Got cached result for $url", TINA4_LOG_DEBUG);
+                        return new RouterResponse(
+                            $cacheResult["content"],
+                            $cacheResult["httpCode"],
+                            array_merge($cacheResult["headers"], $headers),
+                            false,
+                            $cacheResult["contentType"]
+                        );
                     }
                 }
 
@@ -405,26 +537,59 @@ class Router extends Data
                         if (!$this->config->getAuthentication()->validToken($_REQUEST["formToken"])) {
                             return new RouterResponse("", HTTP_FORBIDDEN, $headers);
                         } else {
+                            if ($route["cached"]) {
+                                $cacheResult = $this->getCacheResponse($url.$method);
+                                if ($cacheResult !== null && $url !== "/cache/clear" && $url !== "/migrate" && $url !== "/migrate/create") {
+                                    Debug::message("$this->GUID Got cached result for $url", TINA4_LOG_DEBUG);
+                                    return new RouterResponse(
+                                        $cacheResult["content"],
+                                        $cacheResult["httpCode"],
+                                        array_merge($cacheResult["headers"], $headers),
+                                        false,
+                                        $cacheResult["contentType"]
+                                    );
+                                }
+                            }
+
                             $this->config->setAuthentication(null); //clear the auth
                             $result = $this->getRouteResult($route["class"], $route["function"], $params);
                         }
                     } elseif (!in_array($route["method"], [\TINA4_POST, \TINA4_PUT, \TINA4_PATCH, \TINA4_DELETE], true)) {
                         $this->config->setAuthentication(null); //clear the auth
                         $result = $this->getRouteResult($route["class"], $route["function"], $params);
-                    } else {
+                    } elseif (!empty($this->config->getAuthentication())) {
+                        if ($url === "/git/deploy" || $this->config->getAuthentication()->validToken(json_encode($_REQUEST))) {
+                            $result = $this->getRouteResult($route["class"], $route["function"], $params);
+                        } else {
+                            if ($route["content-type"] === APPLICATION_JSON || $route["content-type"] === APPLICATION_XML) {
+                                return new RouterResponse([], HTTP_FORBIDDEN, $headers, false, $route["content-type"]);
+                            } else {
+                                return new RouterResponse("", HTTP_FORBIDDEN, $headers, false, $route["content-type"]);
+                            }
+                        }
+                    }
+                    else {
                         return new RouterResponse("", HTTP_FORBIDDEN, $headers);
                     }
                 }
 
                 //check for an empty result
                 if ($result === null && !is_array($result) && !is_object($result)) {
-                    return new RouterResponse("", HTTP_OK);
+                    return new RouterResponse("", HTTP_OK, [], false, $route["content-type"]);
                 } elseif (!is_string($result)) {
-                    $headers[] = $result["contentType"];
                     $content = $result["content"];
                     $httpCode = $result["httpCode"];
 
-                    return new RouterResponse($content, $httpCode, $headers);
+                    //Find X Headers and add to the $headers variable TINA4_RETURN_X_HEADERS=true which is default
+                    if (defined("TINA4_RETURN_X_HEADERS") && TINA4_RETURN_X_HEADERS) {
+                        $headers = $this->getXHeaders($headers);
+                    }
+
+                    if (!empty($result["customHeaders"]) && is_array($result["customHeaders"])) {
+                        $headers = array_merge($headers, $result["customHeaders"]);
+                    }
+
+                    return new RouterResponse($content, $httpCode, $headers, $route["cached"], $result["contentType"]);
                 }
 
                 break;

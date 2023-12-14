@@ -29,6 +29,7 @@ class Tina4Php extends Data
             $config = new Config();
         }
 
+
         //Get all the include folders
         if (!defined("TINA4_TEMPLATE_LOCATIONS_INTERNAL")) {
             if (defined("TINA4_TEMPLATE_LOCATIONS")) {
@@ -174,6 +175,28 @@ class Tina4Php extends Data
             return $response("OK");
         });
 
+        //run the deploy in a thread
+        Thread::onTrigger("tina4-run-deploy", static function () {
+            (new \Tina4\GitDeploy())->log("Running a deployment");
+            (new \Tina4\GitDeploy())->doDeploy();
+        });
+
+        /**
+         * @secure
+         */
+        Route::post("/git/deploy", function (Response $response, Request $request) use ($tina4Php) {
+            if ((new GitDeploy())->validateHook($response, $request))
+            {
+                (new \Tina4\GitDeploy())->log("Triggering a deployment");
+                Thread::trigger("tina4-run-deploy", []);
+
+            } else {
+                Debug::message("Not running webhook as it is not valid for running", TINA4_LOG_NOTICE);
+            }
+
+            return $response("OK");
+        });
+
         //Some routes only are available with debugging
         if (defined("TINA4_DEBUG") && TINA4_DEBUG) {
             Route::get("/migrate/create|/migrations/create|/migration/create", function (Response $response) {
@@ -288,7 +311,7 @@ class Tina4Php extends Data
                     $scss_compiler->setImportPaths($scssLocation);
                 }
                 if (!TINA4_SCSS_SPLIT_CSS) {
-                    Debug::message('Creating CSS file: default.css' );
+                    Debug::message('Creating CSS file: default.css', TINA4_LOG_DEBUG );
                     $scssDefault = $scss_compiler->compileString(implode(" ", $scssContent))->getCss();
                     if (file_exists($this->documentRoot . "src" . DIRECTORY_SEPARATOR . "public")) {
                         if (!file_exists($this->documentRoot . "src" . DIRECTORY_SEPARATOR . "public" . DIRECTORY_SEPARATOR . "css") && !mkdir($concurrentDirectory = $this->documentRoot . "src" . DIRECTORY_SEPARATOR . "public" . DIRECTORY_SEPARATOR . "css", 0777, true) && !is_dir($concurrentDirectory)) {
@@ -300,7 +323,7 @@ class Tina4Php extends Data
                     // Split the SCSS into seperate CSS files
                     foreach($scssContent as $filename => $scss) {
                         $outputname = trim($filename).".css";
-                        Debug::message('Creating CSS file:' . $outputname );
+                        Debug::message('Creating CSS file:' . $outputname, TINA4_LOG_DEBUG );
                         $scssDefault = $scss_compiler->compileString($scss)->getCss();
                         if (file_exists($this->documentRoot . "src" . DIRECTORY_SEPARATOR . "public")) {
                             if (!file_exists($this->documentRoot . "src" . DIRECTORY_SEPARATOR . "public" . DIRECTORY_SEPARATOR . "css") && !mkdir($concurrentDirectory = $this->documentRoot . "src" . DIRECTORY_SEPARATOR . "public" . DIRECTORY_SEPARATOR . "css", 0777, true) && !is_dir($concurrentDirectory)) {
@@ -345,10 +368,13 @@ class Tina4Php extends Data
         $content = "";
         if ($routerResponse !== null) {
             if (!headers_sent()) {
-                foreach ($routerResponse->headers as $hid => $header) {
-                    header($header);
+                if ($routerResponse->httpCode !== HTTP_FORBIDDEN) {
+                    foreach ($routerResponse->headers as $hid => $header) {
+                            header($header);    
+                    }
                 }
             }
+            header("Content-Type: " . $routerResponse->contentType);
             http_response_code($routerResponse->httpCode);
             if ($routerResponse->content === "") {
                 //try give back a response based on the error code - first templates then public

@@ -1,3 +1,5 @@
+var formToken = null;
+
 /**
  * Sends an http request
  * @param url
@@ -16,11 +18,21 @@ function sendRequest (url, request, method, callback) {
         method = 'GET';
     }
 
+    //Inject the new token
+    if (formToken !== null) {
+        const regex = /formToken=(.*)/gm;
+        const subst = `formToken=${formToken}`;
+        url = url.replace(regex, subst);
+    }
+
     const xhr = new XMLHttpRequest();
     xhr.open(method, url, true);
 
     xhr.onload = function () {
         let content = xhr.response;
+        console.log('headers', xhr.getResponseHeader('freshToken'));
+        formToken = xhr.getResponseHeader('freshToken');
+
         try {
             content = JSON.parse(content);
             callback(content);
@@ -47,9 +59,12 @@ function getFormData(formName) {
     for (let ie = 0; ie < elements.length; ie++ )
     {
         let element = elements[ie];
+        //refresh the token
+        if (element.name === 'formToken' && formToken !== null) {
+            element.value = formToken;
+        }
         if (element.name) {
             if (element.type === 'file') {
-                console.log('Adding File', element.name);
                 for (let i = 0; i < element.files.length; i++) {
                     let fileData = element.files[i];
                     let elementName = element.name;
@@ -80,18 +95,72 @@ function getFormData(formName) {
 }
 
 /**
+ * Handles the data returned from a request
+ * @param data
+ * @param targetElement
+ */
+function handleHtmlData(data, targetElement) {
+    //Strip out the scripts
+    if (data === "") return '';
+    const parser = new DOMParser();
+    const htmlData = parser.parseFromString(data.includes !== undefined && data.includes('<html>') ? data : '<body>'+data+'</body></html>', 'text/html');
+    const body = htmlData.querySelector('body');
+    const scripts = body.querySelectorAll('script');
+    // remove the script tags
+    body.querySelectorAll('script').forEach(script => script.remove());
+
+    if (targetElement !== null) {
+        if (body.children.length > 0) {
+            document.getElementById(targetElement).replaceChildren(...body.children);
+        } else {
+            document.getElementById(targetElement).replaceChildren(body.innerHTML);
+        }
+        if (scripts) {
+            scripts.forEach(script => {
+                const newScript = document.createElement("script");
+                newScript.type = 'text/javascript';
+                newScript.async = true;
+                newScript.textContent = script.innerText;
+                document.getElementById(targetElement).append(newScript);
+            });
+        }
+    } else {
+        if (scripts) {
+            scripts.forEach(script => {
+                const newScript = document.createElement("script");
+                newScript.type = 'text/javascript';
+                newScript.async = true;
+                newScript.textContent = script.innerText;
+                document.body.append(newScript);
+                console.log(newScript);
+            });
+        }
+
+        return body.innerHTML;
+    }
+
+    return '';
+}
+
+/**
  * Loads a page to a target html element
  * @param loadURL
  * @param targetElement
+ * @callback
  */
-function loadPage(loadURL, targetElement) {
+function loadPage(loadURL, targetElement, callback = null) {
     if (targetElement === undefined) targetElement = 'content';
-    console.log('LOADING', loadURL);
+    console.log('LOADING PAGE', loadURL);
     sendRequest(loadURL, null, "GET", function(data) {
-        if (document.getElementById('#' + targetElement) !== null) {
-            document.getElementById('#' + targetElement).innerHTML = data;
+        let processedHTML = '';
+        if (document.getElementById(targetElement) !== null) {
+            processedHTML = handleHtmlData(data, targetElement);
         } else {
-            console.log('TINA4 - define targetElement for postUrl', data);
+            console.log('TINA4 - define targetElement for loadPage', data);
+        }
+
+        if (callback) {
+            callback(processedHTML);
         }
     });
 }
@@ -101,9 +170,9 @@ function loadPage(loadURL, targetElement) {
  * @param action
  * @param loadURL
  * @param targetElement
+ * @param callback
  */
-function showForm(action, loadURL, targetElement) {
-    console.log(action, loadURL, targetElement);
+function showForm(action, loadURL, targetElement, callback = null) {
     if (targetElement === undefined) targetElement = 'form';
 
     if (action === 'create') action = 'GET';
@@ -111,14 +180,19 @@ function showForm(action, loadURL, targetElement) {
     if (action === 'delete') action = 'DELETE';
 
     sendRequest(loadURL, null, action, function(data) {
+        let processedHTML = '';
         if (data.message !== undefined) {
-            document.getElementById('#' + targetElement).innerHTML = (data.message);
+            processedHTML = handleHtmlData ((data.message), targetElement);
         } else {
-            if (document.getElementById('#' + targetElement) !== null) {
-                document.getElementById('#' + targetElement).innerHTML = data;
+            if (document.getElementById(targetElement) !== null) {
+                processedHTML = handleHtmlData (data, targetElement);
             } else {
                 console.log('TINA4 - define targetElement for showForm', data);
             }
+        }
+
+        if (callback) {
+            callback(processedHTML);
         }
     });
 }
@@ -129,16 +203,21 @@ function showForm(action, loadURL, targetElement) {
  * @param data
  * @param targetElement
  */
-function postUrl(url, data, targetElement) {
+function postUrl(url, data, targetElement, callback= null) {
     sendRequest(url, data, 'POST', function(data) {
+        let processedHTML = '';
         if (data.message !== undefined) {
-            document.getElementById('#' + targetElement).innerHTML = (data.message);
+            processedHTML = handleHtmlData ((data.message), targetElement);
         } else {
-            if (document.getElementById('#' + targetElement) !== null) {
-                document.getElementById('#' + targetElement).innerHTML = data;
+            if (document.getElementById(targetElement) !== null) {
+                processedHTML =  handleHtmlData (data, targetElement);
             } else {
                 console.log('TINA4 - define targetElement for postUrl', data);
             }
+        }
+
+        if (callback) {
+            callback(processedHTML)
         }
     });
 }
@@ -148,19 +227,30 @@ function postUrl(url, data, targetElement) {
  * @param formName
  * @param targetURL
  * @param targetElement
+ * @param callback - optional
  */
-function saveForm(formName, targetURL, targetElement) {
+function saveForm(formName, targetURL, targetElement, callback = null) {
     if (targetElement === undefined) targetElement = 'message';
     //compile a data model
     let data = getFormData(formName);
 
-    postUrl(targetURL, data, targetElement);
+    postUrl(targetURL, data, targetElement, callback);
 }
 
+/**
+ * Shows a message
+ * @param message
+ */
 function showMessage(message) {
-    document.getElementById('message').innerHTML = '<div class="alert alert-info alert-dismissible fade show"><strong>Info</strong> ' + message + '</div>';
+    document.getElementById('message').innerHTML = '<div class="alert alert-info alert-dismissible fade show"><strong>Info</strong> ' + message + '<button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button></div>';
 }
 
+/**
+ * Set cookie
+ * @param name
+ * @param value
+ * @param days
+ */
 function setCookie(name, value, days) {
     let expires = "";
     if (days) {
@@ -171,6 +261,11 @@ function setCookie(name, value, days) {
     document.cookie = name + "=" + (value || "") + expires + "; path=/";
 }
 
+/**
+ * Get cookie
+ * @param name
+ * @returns {null|string}
+ */
 function getCookie(name) {
     let nameEQ = name + "=";
     let ca = document.cookie.split(';');
@@ -208,6 +303,10 @@ const popupCenter = ({url, title, w, h}) => {
     return newWindow;
 }
 
+/**
+ * Opens a popup window
+ * @param sreport
+ */
 function openReport(sreport){
     if (sreport.indexOf("No data available") < 0){
         open(sreport, "content", "target=_blank, toolbar=no, scrollbars=yes, resizable=yes, width=800, height=600, top=0, left=0");
@@ -218,10 +317,7 @@ function openReport(sreport){
 }
 
 function getRoute(loadURL, callback) {
-    $.ajax({
-        method: 'GET',
-        url: loadURL,
-    }).done(function (data) {
-        callback(data);
+    sendRequest(loadURL, null, 'GET', function(data) {
+        callback(handleHtmlData (data, null));
     });
 }

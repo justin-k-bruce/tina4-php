@@ -89,13 +89,12 @@ class Auth extends Data
      */
     public function initSession(): void
     {
-        if (TINA4_CACHE_ON) {
-            session_cache_limiter(false);
-        }
-
         //make sure the session is started
         if (!$this->configured && session_status() === PHP_SESSION_NONE) {
             $this->configured = true;
+            if (TINA4_CACHE_ON) {
+                session_cache_limiter(false);
+            }
             session_start();
         } else {
             $this->configured = true;
@@ -112,7 +111,6 @@ class Auth extends Data
      */
     public function generateSecureKeys(): bool
     {
-
         Debug::message("Generating Auth keys - {$this->documentRoot}secrets");
         if (file_exists($this->documentRoot . "secrets/private.key")) {
             Debug::message("Secrets folder exists already, please remove");
@@ -127,7 +125,7 @@ class Auth extends Data
         //`chmod 600 {$this->documentRoot}secrets/private.key`;
         //`openssl rsa -in {$this->documentRoot}secrets/private.key -pubout -outform PEM -out {$this->documentRoot}secrets/public.pub`;
 
-        $keys = openssl_pkey_new(array('digest_alg' => 'sha256', 'private_key_bits' => 1024,'private_key_type' => OPENSSL_KEYTYPE_RSA));
+        $keys = openssl_pkey_new(array('digest_alg' => 'sha256', 'private_key_bits' => 2048,'private_key_type' => OPENSSL_KEYTYPE_RSA));
 
         if (!empty($keys)) {
             $public_key_pem = openssl_pkey_get_details($keys)['key'];
@@ -164,16 +162,15 @@ class Auth extends Data
     /**
      * Gets an auth token for validating against secure URLS for the session
      * @param array $payLoad
+     * @param int $expiresInDays
      * @param string $privateKey
      * @param string $encryption
      * @return string
      * @tests tina4
      *   assert $this->getPayload($this->getToken(["name" => "tina4"])) === ["name" => "tina4"],"Return back the token"
      */
-    public function getToken(array $payLoad = [], string $privateKey = "", string $encryption = JWT::ALGORITHM_RS256): string
+    public function getToken(array $payLoad = [], int $expiresInDays=0, string $privateKey = "", string $encryption = JWT::ALGORITHM_RS256): string
     {
-        $this->initSession();
-
         if (!empty($privateKey)) {
             $this->privateKey = $privateKey;
         }
@@ -185,11 +182,18 @@ class Auth extends Data
                 $payLoad = ["value" => $payLoad];
             }
 
+            if ($expiresInDays !== 0) {
+                $payLoad["expires"] = time() + $expiresInDays * 24 * 60 * 60;
+            } else
             if (!isset($payLoad["expires"])) { //take care of expires if the user forgets to set it
                 $payLoad["expires"] = time() + TINA4_TOKEN_MINUTES * 60;
             }
         } else {
-            $payLoad["expires"] = time() + TINA4_TOKEN_MINUTES * 60;
+            if ($expiresInDays !== 0) {
+                $payLoad["expires"] = time() + $expiresInDays * 24 * 60 * 60;
+            } else {
+                $payLoad["expires"] = time() + TINA4_TOKEN_MINUTES * 60;
+            }
         }
 
         $tokenDecoded = new TokenDecoded($payLoad);
@@ -229,7 +233,6 @@ class Auth extends Data
     public function validToken(string $token, string $publicKey = "", string $encryption = JWT::ALGORITHM_RS256): bool
     {
         Debug::message("Validating token");
-        $this->initSession();
 
         if (!empty($publicKey)) {
             $this->publicKey = $publicKey;
@@ -318,7 +321,6 @@ class Auth extends Data
         } else {
             $payLoad = $tokenDecoded->getPayload();
 
-
             if (isset($payLoad["expires"])) {
                 unset($payLoad["expires"]);
             }
@@ -348,8 +350,6 @@ class Auth extends Data
      */
     public function validateAuth($request, string $lastPath = null): string
     {
-        $this->initSession();
-
         if (empty($lastPath) && !isset($_SESSION["tina4:lastPath"]) && !empty($_SESSION["tina4:lastPath"])) {
             $lastPath = $_SESSION["tina4:lastPath"];
         } else {
@@ -364,7 +364,6 @@ class Auth extends Data
      */
     public function clearTokens(): void
     {
-        $this->initSession();
         if (isset($_SERVER["REMOTE_ADDR"])) {
             unset($_SESSION["tina4:authToken"]);
         }

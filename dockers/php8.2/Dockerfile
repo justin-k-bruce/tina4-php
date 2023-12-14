@@ -1,8 +1,21 @@
-FROM --platform=linux/amd64 php:8.1-cli-buster
+FROM --platform=linux/amd64 php:8.2-cli-buster
 
 RUN apt-get update \
     && apt-get install -y apt-transport-https gnupg2 libpng-dev libzip-dev nano unzip unixodbc  \
     && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update \
+    && apt-get -y install locales-all && locale-gen \
+    && apt-get -y install gettext \
+    && apt-get -y install poedit \
+    && apt-get clean; rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* /usr/share/doc/*
+
+
+RUN apt-get update \
+    && apt-get -y install locales \
+    && apt-get -y install gettext \
+    && apt-get -y install poedit \
+    && apt-get clean; rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* /usr/share/doc/*
 
 RUN apt-get update && apt-get install -y openssl aptitude git
 RUN apt-get update && apt-get install -y \
@@ -19,11 +32,11 @@ RUN docker-php-ext-install intl
 RUN apt-get install -y libtidy-dev && docker-php-ext-install tidy
 RUN apt-get install -y libxml2-dev && docker-php-ext-install soap
 RUN apt-get install -y libzip-dev && docker-php-ext-install zip
-RUN apt-get install -y libzip-dev && docker-php-ext-install gettext
+RUN apt-get install -y && docker-php-ext-install gettext
 RUN docker-php-ext-install bcmath
 RUN docker-php-ext-install opcache
 
-RUN pecl install xdebug-3.1.5
+RUN pecl install xdebug-3.2.1
 RUN echo -e "zend_extension=xdebug\nxdebug.mode=develop,debug\nxdebug.start_with_request=yes\n" > /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini
 
 
@@ -80,6 +93,7 @@ RUN mv composer.phar /usr/local/bin/composer
 RUN dpkg --add-architecture i386 && apt-get update && apt-get install wine32 -y
 RUN apt-get install wine -y
 RUN docker-php-ext-enable xdebug
+
 COPY ./php.ini-development /usr/local/etc/php/php.ini
 WORKDIR /app
 

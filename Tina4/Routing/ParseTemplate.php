@@ -44,6 +44,7 @@ class ParseTemplate
         if (TINA4_DEBUG) {
             Debug::message("$this->GUID TINA4 Filename: " . $fileName, TINA4_LOG_DEBUG);
         }
+
         if (defined("TINA4_TEMPLATE_LOCATIONS_INTERNAL")) {
             $this->locations = TINA4_TEMPLATE_LOCATIONS_INTERNAL;
         }
@@ -102,7 +103,12 @@ class ParseTemplate
                     $location = $location["path"];
                 }
 
-                $testFile = ($this->root . $location . DIRECTORY_SEPARATOR . $parseFileName);
+                if (file_exists($location)) {
+                    $testFile = ($location . DIRECTORY_SEPARATOR . $parseFileName);
+                } else {
+                    $testFile = ($this->root . $location . DIRECTORY_SEPARATOR . $parseFileName);
+                }
+
                 $testFile = preg_replace('#/+#', DIRECTORY_SEPARATOR, $testFile);
                 if (file_exists($testFile)) {
                     $found = true;
@@ -151,9 +157,10 @@ class ParseTemplate
                 else {
                     Debug::message("$this->GUID Found ".$realFileName, TINA4_LOG_DEBUG);
                     $this->headers[] = "Content-Type: " . $mimeType;
-                    $this->headers[] = ('Cache-Control: max-age=' . (60 * 60) . ', public');
+                    $this->headers[] = ('Cache-Control: max-age=' . (60 * 60 * 60) . ', public');
                     $this->headers[] = "Tina4-Debug: ".$this->GUID;
-                    $this->headers[] = ('Expires: ' . gmdate('D, d M Y H:i:s \G\M\T', time() + (60 * 60))); //1 hour expiry time
+                    $this->headers[] = ('Expires: ' . gmdate('D, d M Y H:i:s \G\M\T', time() + (60 * 60 * 60))); //60 hour expiry time
+                    $this->headers[] = ('Pragma: cache');
                     $this->fileName = $realFileName;
                     if (!is_dir($realFileName)) {
                         $content = file_get_contents($realFileName);
@@ -320,7 +327,7 @@ class ParseTemplate
         if (isset($_SESSION)) {
             foreach ($_SESSION as $varName => $value) {
                 if (!is_array($value) && !is_object($value)) {
-                    $content = str_replace('{{' . $varName . '}}', $value, $content);
+                    $content = str_replace('{{' . $varName . '}}', $value ?? '', $content);
                 }
             }
         }

@@ -8,8 +8,6 @@
 
 namespace Tina4;
 
-use Twig\TwigFunction;
-
 /**
  * Render a twig file or string
  * @param $fileNameString
@@ -24,7 +22,7 @@ function renderTemplate($fileNameString, $data = [], $location = ""): string
     }
 
     if (!empty($fileNameString)) {
-        $fileName = str_replace(TINA4_DOCUMENT_ROOT, "", $fileNameString);
+        $fileName = str_replace(($location !== "" ? $location : TINA4_DOCUMENT_ROOT) , "", $fileNameString);
     } else {
         $fileName = null;
     }
@@ -91,7 +89,9 @@ function renderTemplate($fileNameString, $data = [], $location = ""): string
 
             return $exception->getFile() . " (" . $exception->getLine() . ") " . $exception->getMessage();
         }
+
     } else {
+
         return Utilities::renderErrorTemplate(HTTP_NOT_FOUND);
     }
 }
@@ -124,17 +124,6 @@ function redirect(string $url, int $statusCode = 303): void
     die();
 }
 
-/**
- * Initialize function loads the library for use
- */
-function Initialize(): void
-{
-    if (file_exists("./Tina4/Initialize.php")) {
-        require_once "./Tina4/Initialize.php";
-    } else {
-        require_once __DIR__."/Initialize.php";
-    }
-}
 
 /**
  * Generates an auth token easily
@@ -147,5 +136,18 @@ function getFormToken($payload, $auth=null): string
     if (empty($auth)) {
         $auth = new Auth();
     }
-    return $auth->getToken(["payload" => $payload]);
+    return $auth->getToken(compact('payload'));
+}
+
+/**
+ * Tells us if the operating system is windows
+ * @return bool
+ */
+function isWindows(): bool
+{
+    if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+        return true;
+    } else {
+        return false;
+    }
 }

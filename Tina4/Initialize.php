@@ -15,9 +15,6 @@ if (!defined("TINA4_DATABASE_TYPES")) {
     define("TINA4_DATABASE_TYPES", ["Tina4\DataMySQL", "Tina4\DataFirebird", "Tina4\DataSQLite3", "Tina4\DataMongoDb", "Tina4\DataPostgresql", "Tina4\DataMSSQL"]);
 }
 
-//Get the sub folders etc using the data class
-(new \Tina4\Data());
-
 if (!defined("HTTP_OK")) {
     define("HTTP_OK", 200);
 }
@@ -147,10 +144,14 @@ if (!defined("TINA4_DEBUG_LEVEL")) {
     define("TINA4_DEBUG_LEVEL", [TINA4_LOG_INFO]);
 }
 
+if (!defined( "TINA4_RETURN_X_HEADERS")) {
+    define("TINA4_RETURN_X_HEADERS", true);
+}
+
 Debug::$logLevel = TINA4_DEBUG_LEVEL;
-Debug::message("Project Root: " . TINA4_PROJECT_ROOT);
-Debug::message("Document Root: " . TINA4_DOCUMENT_ROOT);
-Debug::message("SubFolder: " . TINA4_SUB_FOLDER);
+Debug::message("Project Root: " . TINA4_PROJECT_ROOT, TINA4_LOG_DEBUG);
+Debug::message("Document Root: " . TINA4_DOCUMENT_ROOT, TINA4_LOG_DEBUG);
+Debug::message("SubFolder: " . TINA4_SUB_FOLDER, TINA4_LOG_DEBUG);
 
 if (!defined("TINA4_DEBUG")) {
     define("TINA4_DEBUG", false);
@@ -277,63 +278,80 @@ $arrRoutes = [];
 //Add the .htaccess file for redirecting things & copy the default src structure
 if (!file_exists(TINA4_DOCUMENT_ROOT . ".htaccess") && !file_exists(TINA4_DOCUMENT_ROOT . "src")) {
     if (!file_exists(TINA4_DOCUMENT_ROOT . "src")) {
+
         $foldersToCopy = ["src/public", "src/app", "src/routes", "src/templates", "src/orm", "src/services", "src/scss"];
         foreach ($foldersToCopy as $id => $folder) {
             if (!file_exists(TINA4_DOCUMENT_ROOT . $folder)) {
-                \Tina4\Utilities::recurseCopy(TINA4_PROJECT_ROOT . $folder, TINA4_DOCUMENT_ROOT . $folder);
+                \Tina4\Utilities::recurseCopy(TINA4_PROJECT_ROOT . DIRECTORY_SEPARATOR. "tina4php" . DIRECTORY_SEPARATOR . $folder, TINA4_DOCUMENT_ROOT . $folder);
             }
         }
     }
 
-    if (file_exists(TINA4_PROJECT_ROOT . ".htaccess")) {
-        copy(TINA4_PROJECT_ROOT . ".htaccess", TINA4_DOCUMENT_ROOT . ".htaccess");
+    if (file_exists(TINA4_PROJECT_ROOT . DIRECTORY_SEPARATOR. "tina4php" . DIRECTORY_SEPARATOR . ".htaccess")) {
+        copy(TINA4_PROJECT_ROOT . DIRECTORY_SEPARATOR. "tina4php" . DIRECTORY_SEPARATOR. ".htaccess", TINA4_DOCUMENT_ROOT . ".htaccess");
     }
 }
 
 //Copy the bin folder if the vendor one has changed
 if (TINA4_PROJECT_ROOT !== TINA4_DOCUMENT_ROOT) {
-    $tina4Checksum = md5(file_get_contents(TINA4_PROJECT_ROOT . "bin" . DIRECTORY_SEPARATOR . "tina4").file_get_contents(TINA4_PROJECT_ROOT . "bin" . DIRECTORY_SEPARATOR . "tina4service"));
+    $tina4Checksum = md5(file_get_contents(TINA4_PROJECT_ROOT. "tina4php-core". DIRECTORY_SEPARATOR . "bin" . DIRECTORY_SEPARATOR . "tina4").file_get_contents(TINA4_PROJECT_ROOT . "tina4php-core". DIRECTORY_SEPARATOR . "bin" . DIRECTORY_SEPARATOR . "tina4service"));
     $destChecksum = "";
-    if (file_exists(TINA4_DOCUMENT_ROOT . "bin" . DIRECTORY_SEPARATOR . "tina4")) {
-        $destChecksum = md5(file_get_contents(TINA4_DOCUMENT_ROOT . "bin" . DIRECTORY_SEPARATOR . "tina4").file_get_contents(TINA4_DOCUMENT_ROOT . "bin" . DIRECTORY_SEPARATOR . "tina4service"));
+
+    if (file_exists(TINA4_DOCUMENT_ROOT . "tina4php-core". DIRECTORY_SEPARATOR . "bin" . DIRECTORY_SEPARATOR . "tina4")) {
+        $checkContent = file_exists(TINA4_DOCUMENT_ROOT . "tina4php-core". DIRECTORY_SEPARATOR . "bin" . DIRECTORY_SEPARATOR . "tina4") ? file_get_contents(TINA4_DOCUMENT_ROOT . "tina4php-core". DIRECTORY_SEPARATOR . "bin" . DIRECTORY_SEPARATOR . "tina4") : "";
+        $checkContent .= file_exists(TINA4_DOCUMENT_ROOT . "tina4php-core". DIRECTORY_SEPARATOR . "bin" . DIRECTORY_SEPARATOR . "tina4service") ? file_get_contents(TINA4_DOCUMENT_ROOT . "tina4php-core". DIRECTORY_SEPARATOR . "bin" . DIRECTORY_SEPARATOR . "tina4service") : "";
+
+        $destChecksum = md5($checkContent);
     }
 
     if ($tina4Checksum !== $destChecksum) {
-        \Tina4\Utilities::recurseCopy(TINA4_PROJECT_ROOT . "bin", TINA4_DOCUMENT_ROOT . "bin");
+        \Tina4\Utilities::recurseCopy(TINA4_PROJECT_ROOT . "tina4php-core". DIRECTORY_SEPARATOR . "bin", TINA4_DOCUMENT_ROOT . "bin");
     }
 }
 
 //Add the icon file for making it look pretty""
 if (!file_exists(TINA4_DOCUMENT_ROOT . "favicon.ico")) {
-    if (file_exists(TINA4_PROJECT_ROOT . "favicon.ico")) {
-        copy(TINA4_PROJECT_ROOT . "favicon.ico", TINA4_DOCUMENT_ROOT . "favicon.ico");
+    if (file_exists(TINA4_PROJECT_ROOT . DIRECTORY_SEPARATOR. "tina4php" . DIRECTORY_SEPARATOR . "favicon.ico")) {
+        copy(TINA4_PROJECT_ROOT. DIRECTORY_SEPARATOR. "tina4php" . DIRECTORY_SEPARATOR . "favicon.ico", TINA4_DOCUMENT_ROOT . "favicon.ico");
     }
 }
 
-//Initialize the Cache
-global $cache;
-//On a rerun need to check if we have already instantiated the cache
 
-if (defined("TINA4_CACHE_ON") && TINA4_CACHE_ON === true) {
-    if (!file_exists("." . DIRECTORY_SEPARATOR . "cache" . DIRECTORY_SEPARATOR)) {
-        if (!mkdir("." . DIRECTORY_SEPARATOR . "cache" . DIRECTORY_SEPARATOR, 0777, true)) {
+//On a rerun need to check if we have already instantiated the cache
+if (!function_exists("createCache")) {
+    function createCache()
+    {
+        //Initialize the Cache
+        global $cache;
+
+        if (!file_exists("." . DIRECTORY_SEPARATOR . "cache" . DIRECTORY_SEPARATOR) && !mkdir(
+                "." . DIRECTORY_SEPARATOR . "cache" . DIRECTORY_SEPARATOR,
+                0777,
+                true
+            )) {
             Debug::message("Could not create " . DIRECTORY_SEPARATOR . "cache");
         }
-    }
 
-    if (empty($cache)) {
-        //Setup caching options
-        try {
-            $TINA4_CACHE_CONFIG =
-                new ConfigurationOption([
-                    "path" => TINA4_DOCUMENT_ROOT . "cache"
-                ]);
-            CacheManager::setDefaultConfig($TINA4_CACHE_CONFIG);
-            $cache = CacheManager::getInstance("files");
-        } catch (\Phpfastcache\Exceptions\PhpfastcacheInvalidConfigurationException $e) {
-            \Tina4\Debug::message("Could not initialize cache", TINA4_LOG_ERROR);
+        if (empty($cache)) {
+            //Setup caching options
+            try {
+                $TINA4_CACHE_CONFIG =
+                    new ConfigurationOption([
+                        "path" => TINA4_DOCUMENT_ROOT . "cache"
+                    ]);
+                CacheManager::setDefaultConfig($TINA4_CACHE_CONFIG);
+                $cache = CacheManager::getInstance("files");
+            } catch (\Phpfastcache\Exceptions\PhpfastcacheInvalidConfigurationException $e) {
+                \Tina4\Debug::message("Could not initialize cache", TINA4_LOG_ERROR);
+            }
         }
+
+        return $cache;
     }
+}
+
+if (defined("TINA4_CACHE_ON") && TINA4_CACHE_ON === true) {
+    createCache();
 } else {
     $cache = null;
 }

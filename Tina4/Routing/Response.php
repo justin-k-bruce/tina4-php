@@ -14,16 +14,18 @@ namespace Tina4;
  */
 class Response
 {
+
     /**
      * Performs task when invoked
      * @param mixed $content Content of which may be a simple string to show on screen or even a parsed twig template using renderTemplate()
      * @param int $httpCode Response code
      * @param null $contentType Type of content to be responded, default is "text/html"
-     * @return array
+     * @param array $customHeaders
+     * @return array|null
      * @throws \JsonException
      * @example examples\exampleRouteGetAdd.php For simple response
      */
-    public function __invoke($content, int $httpCode = 200, $contentType = null): ?array
+    public function __invoke($content, int $httpCode = 200, $contentType = null, array $customHeaders = []): ?array
     {
         if (empty($contentType) && !empty($_SERVER) && isset($_SERVER["CONTENT_TYPE"])) {
             $contentType = $_SERVER["CONTENT_TYPE"];
@@ -53,8 +55,6 @@ class Response
                 break;
             }
         }
-
-        return ["contentType" => "Content-Type: {$contentType}", "content" => $content, "httpCode" => $httpCode];
+        return ["contentType" => "Content-Type: {$contentType}", "content" => $content, "httpCode" => $httpCode, "customHeaders" => $customHeaders];
     }
-
 }

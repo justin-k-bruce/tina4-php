@@ -20,6 +20,9 @@ class Request
     public $server = null;
     public $session = null;
     public $files = null;
+    public $headers = null;
+    public $rawRequest = null;
+    public $security = null;
 
     /**
      * Filter value
@@ -33,17 +36,19 @@ class Request
                 if (is_array($vValue)) {
                     $value[$vKey] = $this->filterValue($vValue);
                 } else {
-                    $value[$vKey] = htmlspecialchars($vValue, ENT_NOQUOTES);
+                    $value[$vKey] = htmlspecialchars($vValue, ENT_NOQUOTES, "UTF-8");
                 }
             }
         } else {
-            $value = htmlspecialchars($value, ENT_NOQUOTES);
+            $value = htmlspecialchars($value, ENT_NOQUOTES, "UTF-8");
         }
         return $value;
     }
 
     public function __construct($rawRequest, $customRequest=null)
     {
+        $this->rawRequest = $rawRequest;
+
         if (!empty($customRequest->get)) {
             foreach ($customRequest->get as $key => $value) {
                 $_REQUEST[$key] = $value;
@@ -90,6 +95,18 @@ class Request
             }
         }
 
+        $requestHeaders = null;
+        if (function_exists("getallheaders")) {
+            $requestHeaders = getallheaders();
+        }
+
+        if (!empty($requestHeaders)) {
+            $this->headers = $requestHeaders;
+            foreach ($this->headers as $header => $headerValue) {
+                $this->headers[strtolower($header)] = $headerValue;
+            }
+        }
+
         if (!empty($_FILES)) {
             $this->files = $_FILES;
         }
@@ -103,7 +120,7 @@ class Request
         }
 
         if (!empty($rawRequest)) {
-            $this->data = json_decode(utf8_decode($rawRequest), false, 512);
+            $this->data = json_decode($this->rawRequest, false, 512);
             if ($this->data === null && $rawRequest !== '') {
                 $this->data = $rawRequest;
             }

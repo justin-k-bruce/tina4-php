@@ -16,7 +16,7 @@ foreach (get_included_files() as $id => $file) {
 $projectRoot = str_replace(DIRECTORY_SEPARATOR . "bin", "", __DIR__);
 
 if (empty($rootPath)) {
-    $rootPath = str_replace("vendor" . DIRECTORY_SEPARATOR . "tina4stack" . DIRECTORY_SEPARATOR . "tina4php" . DIRECTORY_SEPARATOR . "bin" . DIRECTORY_SEPARATOR . "tina4", "", __FILE__);
+    $rootPath = str_replace("vendor" . DIRECTORY_SEPARATOR . "tina4stack" . DIRECTORY_SEPARATOR . "tina4php-core" . DIRECTORY_SEPARATOR . "bin" . DIRECTORY_SEPARATOR . "tina4", "", __FILE__);
     $rootPath = str_replace("bin" . DIRECTORY_SEPARATOR . "tina4", "", $rootPath);
 }
 
@@ -135,7 +135,7 @@ SetEnvIf Authorization .+ HTTP_AUTHORIZATION=$0';
 
                     $nextIndex = 0;
                     $prompt = "";
-                    $indexContent = '<?php' . PHP_EOL . 'require_once "./vendor/autoload.php";' . PHP_EOL . '$config = new \Tina4\Config();'.PHP_EOL.'\Tina4\Initialize();'. PHP_EOL . 'echo new \Tina4\Tina4Php($config);';
+                    $indexContent = '<?php' . PHP_EOL . 'require_once "./vendor/autoload.php";'. PHP_EOL.'\Tina4\Initialize();' . PHP_EOL. PHP_EOL . '$config = new \Tina4\Config(static function (\Tina4\Config $config){'.PHP_EOL.'  //Your own config initializations '.PHP_EOL.'});'. PHP_EOL . PHP_EOL . 'echo new \Tina4\Tina4Php($config);';
                     file_put_contents($rootPath . DIRECTORY_SEPARATOR . "index.php", $indexContent);
                 } else {
                     $nextIndex = 0;
@@ -307,7 +307,7 @@ $menus[] = ["id" => 3, "name" => "database", "description" => "Create database c
     return ["index" => $nextIndex, "prompt" => $prompt];
 }];
 
-$menus[] = ["id" => 4, "name" => "orm", "description" => "Create orm objects", "menuCode" => static function ($index, $input) {
+$menus[] = ["id" => 4, "name" => "orm", "description" => "Create ORM objects", "menuCode" => static function ($index, $input) {
 
     global $DBA;
     global $session;
@@ -342,7 +342,7 @@ $menus[] = ["id" => 4, "name" => "orm", "description" => "Create orm objects", "
                         foreach ($fields as $id => $field) {
                             echo "{$field->fieldName}\n";
                         }
-                        $session["tableData"][] = ["table" => $table, "fields" => $fields];
+                        $session["tableData"][] = compact('table', 'fields');
                     }
                 }
 
@@ -354,54 +354,62 @@ $menus[] = ["id" => 4, "name" => "orm", "description" => "Create orm objects", "
                 break;
             case 2:
                 $nextIndex = -1;
+                //we are skipping the index 1 step
+                $no = 0;
+                foreach ($database as $table => $fields) {
+                    $no++;
+                    if ($no == $input || $input == "all") {
+                        $session["tableData"][] = compact('table', 'fields');
+                    }
+                }
 
-                if ($input === "y") {
-                    $record = new \Tina4\DataRecord();
-                    foreach ($session["tableData"] as $id => $data) {
-                        $className = ucwords($record->getObjectName($data["table"]));
 
-                        $fields = [];
-                        $fieldMapping = [];
-                        $primaryKey = "";
-                        foreach ($data["fields"] as $fid => $field) {
-                            if ($fid == 0 || $field->isPrimaryKey === 1) {
-                                $primaryKey = $field->fieldName;
-                            }
-                            $fieldMapping [] = '"' . $record->getObjectName($field->fieldName) . '" => "' . $field->fieldName . '"';
-                            $fields[] = "\tpublic \$" . $record->getObjectName($field->fieldName) . ";";
+                $record = new \Tina4\DataRecord();
+                foreach ($session["tableData"] as $id => $data) {
+                    $className = ucwords($record->getObjectName($data["table"]));
+
+                    $fields = [];
+                    $fieldMapping = [];
+                    $primaryKey = "";
+                    foreach ($data["fields"] as $fid => $field) {
+                        if ($fid == 0 || $field->isPrimaryKey === 1) {
+                            $primaryKey = $field->fieldName;
                         }
+                        $fieldMapping [] = '"' . $record->getObjectName($field->fieldName) . '" => "' . $field->fieldName . '"';
+                        $fields[] = "\tpublic \$" . $record->getObjectName($field->fieldName) . ";";
+                    }
 
                         $definition = '<?php
 class [CLASS_NAME] extends \Tina4\ORM
 {
     public $tableName="[TABLE_NAME]";
     public $primaryKey="[PRIMARY_KEY]"; //set for primary key
-    public $fieldMapping = [[FIELD_MAPPING]];
-    //public $softDelete=true; //uncomment for soft deletes in crud
+    //public $fieldMapping = [[FIELD_MAPPING]];
+    //public $genPrimaryKey=false; //set to true if you want to set the primary key
+    //public $ignoreFields = []; //fields to ignore in CRUD
+    //public $softDelete=true; //uncomment for soft deletes in crud 
     
 [FIELDS]
 }';
 
-                        $fileName = $rootPath . "src" . DIRECTORY_SEPARATOR . "orm" . DIRECTORY_SEPARATOR . $className . ".php";
+                    $fileName = $rootPath . "src" . DIRECTORY_SEPARATOR . "orm" . DIRECTORY_SEPARATOR . $className . ".php";
 
-                        echo "Creating object in {$fileName} {$className}\n";
-                        if (!file_exists($fileName)) {
-                            $definition = str_replace("[PRIMARY_KEY]", $record->getObjectName($primaryKey), $definition);
-                            $definition = str_replace("[TABLE_NAME]", $data["table"], $definition);
-                            $definition = str_replace("[CLASS_NAME]", $className, $definition);
-                            $definition = str_replace("[FIELDS]", join("\n", $fields), $definition);
-                            $definition = str_replace("[FIELD_MAPPING]", join(",", $fieldMapping), $definition);
-                            file_put_contents($fileName, $definition);
-                        }
+                    echo "Creating object in {$fileName} {$className}\n";
+                    if (!file_exists($fileName)) {
+                        $definition = str_replace("[PRIMARY_KEY]", $record->getObjectName($primaryKey), $definition);
+                        $definition = str_replace("[TABLE_NAME]", $data["table"], $definition);
+                        $definition = str_replace("[CLASS_NAME]", $className, $definition);
+                        $definition = str_replace("[FIELDS]", join("\n", $fields), $definition);
+                        $definition = str_replace("[FIELD_MAPPING]", join(",", $fieldMapping), $definition);
+                        file_put_contents($fileName, $definition);
                     }
-                    $prompt = "Done, press Enter to continue!";
-                } else {
-                    $prompt = "Press Enter to continue, no object created!";
                 }
+                $prompt = "Done, press Enter to continue!";
+
                 $session["tableData"] = null;
                 break;
             default:
-                $nextIndex = 1;
+                $nextIndex = 2;
                 $no = 0;
                 foreach ($database as $table => $fields) {
                     $no++;
@@ -419,12 +427,20 @@ class [CLASS_NAME] extends \Tina4\ORM
 
 addMenu($menus, "webservice", "Runs webservice", static function ($index, $input) use ($argv) {
     $port = $argv[2] ?? "7145";
-    \Tina4\Debug::message("Server running on http://localhost:{$port}");
-    if (strpos(php_uname(), "Linux") !== false) {
-        `php -S 0.0.0.0:{$port} index.php`;
+
+    if (strpos($port, ":") !== false) {
+        $host = explode(":", $port)[0];
+        $port = explode(":", $port)[1];
     } else {
-        `php -S localhost:{$port} index.php`;
+        $host = $host ?? "localhost";
+        if (strpos(php_uname(), "Linux") !== false) {
+            $host = "0.0.0.0";
+        }
     }
+
+    \Tina4\Debug::message("Server running on http://localhost:{$port}");
+
+    `php -S {$host}:{$port} index.php`;
 
 }, true,  ["options" => ["run"]]);
 
