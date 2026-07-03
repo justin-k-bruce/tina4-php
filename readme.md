@@ -1,398 +1,537 @@
-<img src="branding/SVG/Logos/tina4-logo-transparent.svg" width="300">
+<p align="center">
+  <img src="https://tina4.com/logo.svg" alt="Tina4" width="200">
+</p>
 
-Tina4 is a light-weight routing and twig based templating system which allows you to write websites and API applications
-very quickly. Currently, the full deployment is under 8mb in size, and we are aiming at being the PHP framework with the smallest carbon footprint.
-Due to the nature of the code being very compact and all functionality engineered from the ground up we trust you will find it a pleasant experience.
+<h1 align="center">Tina4 PHP</h1>
+<h3 align="center">The Intelligent Native Application 4ramework</h3>
 
-Join us on [Discord](https://discord.gg/UUkRq7sgSU) to be part of the journey.
+<p align="center">
+  55 built-in features. Zero dependencies. One require, everything works.
+</p>
 
-The premise of the project is to make you the developer and PHP, the heroes!
+<p align="center">
+  <a href="https://packagist.org/packages/tina4stack/tina4php"><img src="https://img.shields.io/packagist/v/tina4stack/tina4php?color=7b1fa2&label=Packagist" alt="Packagist"></a>
+  <img src="https://img.shields.io/badge/tests-2%2C073%20passing-brightgreen" alt="Tests">
+  <img src="https://img.shields.io/badge/features-55-blue" alt="Features">
+  <img src="https://img.shields.io/badge/dependencies-0-brightgreen" alt="Zero Deps">
+  <a href="https://tina4.com"><img src="https://img.shields.io/badge/docs-tina4.com-7b1fa2" alt="Docs"></a>
+</p>
 
-[![PHP Composer](https://github.com/tina4stack/tina4-php/actions/workflows/php.yml/badge.svg)](https://github.com/tina4stack/tina4-php/actions/workflows/php.yml)
+<p align="center">
+  <a href="https://tina4.com">Documentation</a> &bull;
+  <a href="#quick-start">Quick Start</a> &bull;
+  <a href="#whats-built-in-55-features">Features</a> &bull;
+  <a href="#cli-reference">CLI Reference</a> &bull;
+  <a href="https://tina4.com">tina4.com</a>
+</p>
 
-### Installing ###
+---
 
-We are currently testing on latest PHP 8.2, please report any issues you may find.
+## Quick Start
 
-- Install PHP7.4 >  make sure the following extensions are enabled: fileinfo, mbstring, curl, gd, xml.
-- Install Composer * Windows users must install openssl so that the JWT keys will be generated correctly
-- Create a project folder where you want to work
-- In your project folder terminal / console
-
-#### Install with composer from terminal
 ```bash
+# Install the Tina4 CLI (one-time, cross-language)
+cargo install tina4    # or download a binary from https://github.com/tina4stack/tina4/releases
+
+# Create a project
+tina4 init php ./my-app
+
+# Run it
+cd my-app && tina4 serve
+```
+
+Open http://localhost:7145 -- your app is running.
+
+<details>
+<summary><strong>Without the Tina4 CLI</strong></summary>
+
+```bash
+# 1. Install
 composer require tina4stack/tina4php
-```
 
-#### Begin your Tina4 project using
+# 2. Entry point
+echo '<?php require "vendor/autoload.php"; (new Tina4\App())->run();' > index.php
 
-```bash
-composer exec tina4 initialize:run
-```
+# 3. .env
+echo 'TINA4_DEBUG=true' > .env
 
-#### Spin up a web server with PHP in your terminal in the project folder
-
-```bash
+# 4. Run (no file watching in this mode)
 composer start
-````
-
-Hit up http://localhost:7145 in your browser, you should see the documentation page
-
-If you want to run the webservice on a specific port
-
-```
-composer start 8080
 ```
 
-### Database support
+Open http://localhost:7145
 
-The ORM and database modules are all extracted into their own packagist modules.
-The ORM and database metadata work now using a more uniform mechanism. The service module now
-is created under bin and tina4 service and tina4 bin executables are replaced when their checksums change.
+</details>
 
-Database support table
+---
 
-| Database   | Composer Command                                      |
-|------------|-------------------------------------------------------|
-| Sqlite3    | ```composer require tina4stack/tina4php-sqlite3```    |
-| ODBC       | ```composer require tina4stack/tina4php-odbc```       |
-| MySQL      | ```composer require tina4stack/tina4php-mysql```      |
-| Firebird   | ```composer require tina4stack/tina4php-firebird```   |
-| MongoDB    | ```composer require tina4stack/tina4php-mongodb```    |
-| PostgreSQL | ```composer require tina4stack/tina4php-postgresql``` |
-| MSSQL      | ```composer require tina4stack/tina4php-mssql```      |
-| PDO        | ```composer require tina4stack/tina4php-pdo```        |
+## What's Built In (55 Features)
 
-**Features**
+Every feature is built from scratch -- no bloated vendor trees, no third-party runtime dependencies in core.
 
-- Auto templating with TWIG
-- Auto inclusions & project structure
-- Open API Annotations for quick Swagger documentation & security
-- Annotation driven testing, write unit tests as you code
-- Tina4 ORM
-- Service Runner
-- Async triggers and events
-- Out of the box support for Swoole
-- Modular programming, each project is a potential module.
+| Category | Features |
+|----------|----------|
+| **Core HTTP** (7) | Router with path params (`{id:int}`, `{p:path}`), Server, Request/Response, Middleware pipeline, Static file serving, CORS |
+| **Database** (6) | SQLite, PostgreSQL, MySQL, MSSQL, Firebird -- unified adapter, connection pooling, query cache, transactions, race-safe ID generation, SQL dialect translation |
+| **ORM** (7) | Active Record with typed fields, relationships (`has_one`/`has_many`/`belongs_to`), soft delete, QueryBuilder + MongoDB support, Auto-CRUD generator, migrations with rollback |
+| **Auth & Security** (5) | JWT (HS256/RS256), password hashing (PBKDF2-SHA256), API key validation, rate limiting, CSRF form tokens |
+| **Templating** (3) | Frond engine (Twig/Jinja2-compatible, pre-compiled 2.8x faster), SCSS auto-compilation, built-in CSS (~24 KB) |
+| **API & Integration** (5) | HTTP client (zero-dep), GraphQL with ORM auto-schema + GraphiQL IDE, WSDL/SOAP with auto WSDL, WebSocket (RFC 6455) + Redis backplane, MCP server (24 dev tools) |
+| **Background** (3) | Job queue (File/RabbitMQ/Kafka/MongoDB) with priority, delay, retry, dead letters -- service runner -- event system (on/emit/once/off) |
+| **Data & Storage** (4) | Session (File/Redis/Valkey/MongoDB/DB), response cache (LRU, TTL), seeder + 50+ fake data generators, messenger (SMTP/IMAP) |
+| **Developer Tools** (7) | Dev dashboard (11 tabs), dev toolbar, error overlay (Catppuccin Mocha), dev mailbox, hot reload + CSS hot-reload, code metrics (complexity, coupling, maintainability), AI context installer (7 tools) |
+| **Utilities** (7) | DI container (transient + singleton), HtmlElement builder, inline testing (`@tests` decorator), i18n (6 languages), Swagger/OpenAPI auto-generation, CLI scaffolding (`generate model/route/migration/middleware`), structured logging |
 
+**2,073 tests. Zero dependencies. Full parity across Python, PHP, Ruby, and Node.js.**
 
-#### Run tests
+For full documentation visit **[tina4.com](https://tina4.com)**.
 
-```bash
-composer test
-```
+---
 
-#### Start service
+## Features
 
-```bash
-composer start-service
-```
-
-#### Tina4 menu
-
-```bash
-composer tina4
-```
-
-*Note* The above command only seems to run on Linux and Mac
-
-On Windows do the following:
-
-```
-php bin\tina4
-```
-
-### Working with Docker ###
-
-This requires you to have your docker environment already running
-
-We assume /app is the internal path for the current project
-*Installing*
-
-```
-docker run -v $(pwd):/app tina4stack/php:latest composer require tina4stack/tina4php
-```
-
-```
-docker run -v $(pwd):/app tina4stack/php:latest composer exec tina4 initialise:run
-```
-
-*Upgrading*
-
-```
-docker run -v $(pwd):/app -p7145:7145 tina4stack/php:latest composer upgrade 
-```
-
-*Running*
-
-```
-docker run -v $(pwd):/app -p7145:7145 tina4stack/php:latest composer start 
-```
-
-On a different port like 8080 for example
-
-```
-docker run -v $(pwd):/app -p8080:8080 tina4stack/php:latest composer start 8080
-```
-
-### Quick Reference ###
-
-The folder layout is as follows and can be overridden by defining PHP constants for ```TINA4_TEMPLATE_LOCATIONS```
-, ```TINA4_ROUTE_LOCATIONS``` & ```TINA4_INCLUDE_LOCATIONS```:
-
-* src
-    * app (helpers, PHP classes)
-    * public (system twig files, images, css, js)
-    * orm (ORM objects - extend \Tina4\ORM)
-    * routes (routing)
-    * scss - style sheet templates
-    * services (service processes - extend \Tina4\Process)
-    * templates (app twig files)
-
-#### .Env Configuration
-
-Tina4 uses a .env file to set up project constants, a .env will be created for you when the system runs for the first
-time. If you specify an environment variable on your OS called ENVIRONMENT then .env.ENVIRONMENT will be loaded instead.
-
-```bash
-[Section]           <-- Group section
-MY_VAR=Test         <-- Example declaration, no quotes required or escaping, quotes will be treated as part of the variable
-# A comment        <-- This is a comment
-[Another Section]
-VERSION=1.0.0
-```
-
-Do not include your .env files with your project if they contain sensitive information like password, instead create an
-example of how it should look.
-
-### Example of Routing
-
-Creating API end points and routers in Tina4 is simple as indicated below. If you are adding swagger annotations, simply
-hit up the /swagger end point to see the OpenApi rendering.
+### Routing
 
 ```php
-/**
-* @description Swagger Description
-* @tags Example,Route
-*/
-\Tina4\Get::add("/hello-world", function(\Tina4\Response $response){
-    return $response ("Hello World!");
+use Tina4\Router;
+use Tina4\Request;
+use Tina4\Response;
+
+Router::get("/api/items", function (Request $request, Response $response) {
+    return $response(["items" => []], HTTP_OK);
+});
+
+Router::post("/api/webhook", function (Request $request, Response $response) {
+    return $response(["ok" => true], HTTP_OK);
+})->noAuth();
+```
+
+Path parameters: `{id}`, `{name}`, `{slug}`. Middleware chaining with `->middleware([...])`. Chain `->secure()` to protect GET routes, `->noAuth()` to make routes public.
+
+### ORM
+
+```php
+class User extends \Tina4\ORM
+{
+    public $tableName = "users";
+    public $primaryKey = "id";
+    public $softDelete = true;
+
+    public $id;
+    public $name;
+    public $email;
+
+    public $hasMany = [["Order" => "userId"]];
+    public $hasOne = [["Profile" => "userId"]];
+    public $belongsTo = [["Customer" => "customerId"]];
+}
+
+$user = new User($request);
+$user->save();
+$user->load("email = 'alice@example.com'");
+$user->delete();
+
+$users = (new User())->select("*", 100)->asArray();
+```
+
+### Database
+
+Unified interface via `Database::create()`:
+
+```php
+use Tina4\Database\Database;
+
+$db = Database::create('sqlite:///app.db');
+$db = Database::create('postgres://localhost:5432/mydb', username: 'user', password: 'pass');
+$db = Database::create('mysql://localhost:3306/mydb', username: 'root', password: 'secret');
+$db = Database::create('mssql://localhost:1433/mydb', username: 'sa', password: 'pass');
+$db = Database::create('firebird://localhost:3050/path/to/db.fdb', username: 'SYSDBA', password: 'masterkey');
+
+$result = $db->fetch("SELECT * FROM users WHERE age > ?", [18]);
+```
+
+### JWT Authentication
+
+```php
+$token = \Tina4\Auth::getToken(["user_id" => 42], "your-secret");
+$payload = \Tina4\Auth::validToken($token, "your-secret");
+$claims = \Tina4\Auth::getPayload($token);
+```
+
+POST/PUT/PATCH/DELETE routes require `Authorization: Bearer <token>` by default.
+
+### Sessions
+
+```php
+// File, Redis, Valkey, MongoDB, or database-backed sessions
+$_SESSION["user_id"] = 42;
+$userId = $_SESSION["user_id"];
+```
+
+Configure via `.env`:
+
+```bash
+TINA4_SESSION_HANDLER=redis
+TINA4_SESSION_PATH=redis://localhost:6379
+```
+
+### Queues
+
+```php
+use Tina4\Queue;
+
+$queue = new Queue();
+$queue->push("email.send", ["to" => "alice@example.com", "subject" => "Welcome"]);
+$queue->push("report.generate", ["id" => 42], priority: 10, delay: 60);
+
+// Process jobs
+$queue->process("email.send", function ($job) {
+    sendEmail($job["to"], $job["subject"]);
 });
 ```
 
-Routes can also be mapped to class methods, static methods are preferred for routing, but you can mix and match for
-example if you want to keep all functionality neatly together.
+Backends: File (default), RabbitMQ, Kafka, MongoDB. Supports priority, delay, retry, and dead letters.
+
+### GraphQL
+
+```php
+// Auto-schema from ORM models -- no configuration needed
+// GET  /graphql  -> GraphiQL IDE
+// POST /graphql  -> Execute queries
+
+// Query:  { users { id, name, email } }
+// Mutation support via ORM save/delete
+```
+
+### WebSocket
+
+```php
+use Tina4\WebSocket;
+
+$ws = new WebSocket('0.0.0.0', 8080);
+
+$ws->on('message', function ($connection, $message) {
+    $connection->send("Echo: " . $message);
+});
+
+$ws->on('open', function ($connection) {
+    $connection->send("Welcome!");
+});
+
+$ws->start();
+```
+
+Supports RFC 6455, per-path routing, connection manager, broadcast, and Redis backplane for horizontal scaling.
+
+### Swagger / OpenAPI
+
+Auto-generated at `/swagger`:
 
 ```php
 /**
- * Example of route calling class , method
- * Note the swagger annotations will go in the class
+ * @description Get all users
+ * @tags Users
  */
-\Tina4\Get::add("/test/class", ["Example", "route"]);
-
+Router::get("/api/users", function (Request $request, Response $response) {
+    return $response((new User())->select("*", 100)->asArray(), HTTP_OK);
+});
 ```
 
-Example.php
+### Event System
 
 ```php
+use Tina4\Events;
 
-class Example
-{
-    public function someThing() {
-        return "Yes!";
-    }
-    
-    /**
-     * @param \Tina4\Response $response
-     * @return array|false|string
-     * @description Hello Normal -> see Example.php route
-     */
-    public function route (\Tina4\Response $response) {
-        return $response ("OK!");
-    }
+Events::on("user.created", function ($user) {
+    sendWelcomeEmail($user);
+}, priority: 10);
 
-}
+Events::once("app.boot", function () {
+    warmCaches();
+});
+
+Events::emit("user.created", $userData);
+Events::off("user.created");
 ```
 
-### Example of a database connection to SQLite3
-
-You can add lines like this by using the tina4 tool or by pasting the example below into your index.php file.
+### WSDL / SOAP
 
 ```php
-
-global $DBA;
-$DBA = new \Tina4\DataSQLite3("test.db");
-  
+// Auto WSDL generation from annotated service classes
+// Endpoint: /wsdl
 ```
 
-### Example of ORM Objects in relationship
+### REST Client
 
 ```php
-class Address extends \Tina4\ORM
-{
-    public $id;
-    public $address;
-    public $customerId;
-
-    //Link up customerId => Customer object
-    public $hasOne = [["Customer" => "customerId"]];
-}
-
-class Customer extends \Tina4\ORM
-{
-    public $primaryKey = "id";
-    public $id;
-    public $name;
-
-    //Primary key id maps to customerId on Address table
-    public $hasMany = [["Address" => "customerId"]];
-}
-
-
-````
-
-And some code using the above objects
-
-```php
-
-$customer = (new Customer());
-$customer->id = 1;
-$customer->name = "Test";
-$customer->save();
-
-$address = (new Address());
-$address->address = "1 Street";
-$address->customerId = 1;
-$address->save();
-
-$customer = (new Customer());
-$customer->addresses[0]->address = "Another Address";
-$customer->addresses[0]->address->save(); //Save the address
-$customer->load("id = 1");
-
-$address = new Address();
-$address->load("id = 1");
-$address->address = "New Street Address";
-$address->customer->name = "New Name for customer"
-$address->customer->save(); //save the customer
-$address->save();
-
+$api = new \Tina4\Api("https://api.example.com", "Bearer xyz");
+$result = $api->sendRequest("/users/42");
+$result = $api->sendRequest("/users", "POST", ["name" => "Alice"]);
 ```
 
-### Run tests from the command line
-
-Give this a try and see what happens
-
-```commandline
-composer test
-```
-
-Writing unit tests is easy and can be done as an annotation in your code comments
+### Seeder & Fake Data
 
 ```php
+use Tina4\FakeData;
 
+$fake = new FakeData();
+$fake->name();        // "Alice Johnson"
+$fake->email();       // "alice.johnson@example.com"
+$fake->phone();       // "+1-555-0123"
+$fake->address();     // "123 Main St, Springfield"
+$fake->paragraph();   // Lorem ipsum...
+```
+
+50+ generators for names, emails, addresses, dates, numbers, text, and more.
+
+### Messenger (SMTP/IMAP)
+
+```php
+use Tina4\Messenger;
+
+$messenger = new Messenger();
+$messenger->sendEmail(
+    "recipient@example.com",
+    "Subject Line",
+    "<h1>Hello</h1><p>Message body</p>"
+);
+```
+
+Configure via `.env`:
+
+```bash
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_USERNAME=user@example.com
+SMTP_PASSWORD=secret
+```
+
+### Template Engine (Frond)
+
+Twig-compatible with pre-compilation for 2.8x faster rendering:
+
+```twig
+{% extends "base.twig" %}
+{% block content %}
+<h1>{{ title | upper }}</h1>
+{% for item in items %}
+    <p>{{ item.name }} -- {{ item.price | number_format(2) }}</p>
+{% endfor %}
+{% include "partials/sidebar.twig" %}
+{% endblock %}
+```
+
+### DI Container
+
+```php
+$container = new \Tina4\Container();
+$container->singleton('db', fn() => Database::create(getenv('DB_URL')));
+$container->register('mailer', fn() => new MailService());
+
+$db = $container->get('db');       // same instance every time
+$mailer = $container->get('mailer'); // new instance each time
+```
+
+### Inline Testing
+
+```php
 /**
- * Some function to add numbers
  * @tests
  *   assert (1,1) === 2, "1 + 1 = 2"
  *   assert is_integer(1,1) === true, "This should be an integer"
  */
-function add ($a,$b) {
-    return $a+$b;
+function add($a, $b) {
+    return $a + $b;
 }
-
 ```
 
-### Triggers and Events
+### i18n (Localization)
 
-Tina4Php supports a very limited threading or triggering of events using popen to execute and "thread" out triggered code.
-There are some caveats as the code cannot have comments in and only simple variables can be used. Other than that almost anything can be accomplished.
-
-#### Example of a trigger and it firing:
+JSON translation files with placeholder interpolation. Supports 6 languages out of the box.
 
 ```php
-//Example of the triggered event, notice the sleep timer which should shut down most code on windows or linux making PHP wait for the result.
+use Tina4\I18n;
 
-\Tina4\Thread::addTrigger("me", static function($name, $sleep=1, $hello="OK"){
-    $iCount = 0;
-    while ($iCount < 10) {
-        file_put_contents("./log/event.log", "Hello {$name} {$hello}!\n", FILE_APPEND);
-        sleep($sleep);
-        $iCount++;
-    }
-});
+$i18n = new I18n('en');
+echo $i18n->translate("welcome.message", ["name" => "Alice"]);
 ```
 
-Here the trigger is fired on 2 routes, hit each one up in your browser to see the output in the event.log
+### HtmlElement Builder
 
 ```php
-\Tina4\Get::add("/test", function(\Tina4\Response $response){
-    
-    \Tina4\Thread::trigger("me", ["Again", 1, "Moo!"]);
-
-    return $response("OK!");
-});
-
-\Tina4\Get::add("/test/slow", function(\Tina4\Response $response){
-
-    \Tina4\Thread::trigger("me", ["Hello", 3]);
-
-    return $response("OK!");
-});
+extract(\Tina4\HtmlElement::helpers());
+echo $_div(["class" => "card"],
+    $_h2("Title"),
+    $_p("Content")
+);
 ```
 
-The output to the event.log file should happen asynchronously whilst the routes return back immediately to the user browsing.
+---
 
-### Triggering deployments using git web hooks
+## Dev Mode
 
-There is a built-in path that will trigger a deployment from a github webhook on your system
+Set `TINA4_DEBUG=true` in `.env` to enable:
 
-```
-https://<site-name>/git/deploy
-```
+- **Dev dashboard** (`/__dev/`) -- admin UI with route inspection, query runner, queue management, WebSocket monitor, dev mailbox, and more
+- **Dev toolbar** -- fixed bar showing HTTP method, matched route, request ID, and PHP version
+- **Error overlay** -- syntax-highlighted stack traces with Catppuccin Mocha theme
+- **Hot reload** -- the `tina4` Rust CLI watches `src/`, `migrations/`, `.env` and POSTs `/__dev/api/reload`; PHP broadcasts to the browser via WebSocket (`/__dev_reload`) with a polling fallback on `GET /__dev/api/mtime`. SCSS changes swap the stylesheet without a full reload
+- **Template debug** -- `{{ dump(variable) }}` available, no caching
 
-This requires the following to be in your .env to work; and you will need to generate a secret to be shared between the systems.
-Additionally, you can specify directories from your repository to be included in your deployment with ```GIT_DEPLOYMENT_DIRS```
-Make sure you give permissions to git on the system you deploy to if you work with a private repository.
-```
-[DEPLOYMENT]
-GIT_TINA4_PROJECT_ROOT=.
-GIT_BRANCH=master
-GIT_REPOSITORY=https://github.com/tina4stack/tina4-php.git
-GIT_SECRET=0123456789
-GIT_DEPLOYMENT_STAGING=..\staging
-GIT_DEPLOYMENT_PATH=deploy-test
-GIT_DEPLOYMENT_DIRS=["branding", "bin"]
-SLACK_NOTIFICATION_CHANNEL="general"
-```
+---
 
+## CLI Reference
 
-
-### PhpDocs
-
-```
-docker run --rm -v %cd%:/data phpdoc/phpdoc:3 -d Tina4
+```bash
+bin/tina4php serve [--port P] [--host H]     # Start dev server (default: 0.0.0.0:7145)
+bin/tina4php migrate                         # Run pending migrations
+bin/tina4php migrate:create "description"    # Create a migration file
+bin/tina4php generate model <name>           # Generate ORM model scaffold
+bin/tina4php generate route <name>           # Generate route scaffold
+bin/tina4php generate migration <desc>       # Generate migration file
+bin/tina4php generate middleware <name>       # Generate middleware scaffold
+bin/tina4php seed                            # Run database seeders
+bin/tina4php ai [--all]                      # Install AI context files
 ```
 
-### Building the docker
+Or via Composer:
 
-```
-docker build . -t tina4stack/php:7.4
+```bash
+composer start                               # Start dev server
+composer start --production                  # Start with OPcache + production config
+composer test                                # Run test suite
+composer tina4 migrate                       # Run migrations
+composer tina4 generate model User           # Scaffold a model
 ```
 
-### Deploy the docker
+---
 
-```
- docker push tina4stack/php:7.4
-```
-### Jquery validate cheat sheet
-https://gist.github.com/rhacker/3550309
+## Performance
 
-### Todo
-- Add health check
-- Add GUID for each request, flow through to the rest of the code
+Benchmarked with `wrk`: 5,000 requests, 50 concurrent, median of 3 runs:
 
-### If homebrew breaks after running a pecl install ext for some reason - zsh: killed     php 
+| Framework | JSON req/s | Deps | Features |
+|-----------|-----------|------|----------|
+| **Tina4 PHP** | **29,293** | 0 | 55 |
+| Slim | 5,714 | 10+ | ~6 |
+| Laravel | 445 | 50+ | ~25 |
+
+Tina4 PHP is **5× faster than Slim and 65× faster than Laravel**, with zero dependencies and 55 features built in.
+
+**Across all 4 Tina4 implementations:**
+
+| | Python | PHP | Ruby | Node.js |
+|---|--------|-----|------|---------|
+| **JSON req/s** | 6,508 | 29,293 | 10,243 | 84,771 |
+| **Dependencies** | 0 | 0 | 0 | 0 |
+| **Features** | 55 | 55 | 55 | 55 |
+
+---
+
+## Cross-Framework Parity
+
+Tina4 ships the same 55 features across four languages with full test parity:
+
+| Language | Package | Tests (v3.11.12) |
+|----------|---------|------------------|
+| **Python** | `pip install tina4-python` | 2,281 |
+| **PHP** | `composer require tina4stack/tina4php` | 2,073 |
+| **Ruby** | `gem install tina4` | 2,508 |
+| **Node.js** | `npm install @tina4/core` | 2,897 |
+
+Same routing, same ORM, same templates, same CLI, same dev tools. Learn one, deploy in any.
+
+---
+
+## Environment
+
+Key `.env` variables:
+
+```bash
+# Core
+TINA4_DEBUG=true                        # Enable debug mode
+DATABASE_PATH=app.db                    # SQLite database path (or use TINA4_DATABASE_URL)
+TINA4_DATABASE_URL=postgres://localhost/mydb  # Connection URL for any database
+SECRET=your-jwt-secret                  # JWT signing secret
+TINA4_LOCALE=en                         # Localization language
+
+# Database
+TINA4_DB_CACHE=true                     # Enable query caching (4x speedup)
+TINA4_AUTOCOMMIT=false                  # Auto-commit control (default: off)
+
+# Sessions
+TINA4_SESSION_HANDLER=file              # file, redis, valkey, mongodb, database
+TINA4_SESSION_PATH=redis://localhost    # Session backend URL
+TINA4_SESSION_SAMESITE=Lax             # SameSite cookie attribute
+
+# Cache
+TINA4_CACHE_TTL=60                      # Response cache TTL in seconds
+TINA4_CACHE_MAX_ENTRIES=1000            # Max cached responses
+
+# WebSocket
+TINA4_WS_BACKPLANE=redis               # WebSocket scaling backplane
+TINA4_WS_BACKPLANE_URL=redis://localhost # Backplane connection URL
+
+# Swagger
+SWAGGER_TITLE=My API                    # Swagger page title
+SWAGGER_DESCRIPTION=API docs            # Swagger description
+
+# SMTP
+SMTP_HOST=smtp.example.com             # Mail server
+SMTP_PORT=587                           # Mail port
+SMTP_USERNAME=user@example.com         # Mail username
+SMTP_PASSWORD=secret                    # Mail password
 ```
-sudo chown -R "$(id -un)":"$(id -gn)" /opt/homebrew
+
+---
+
+## Zero-Dependency Philosophy
+
+Tina4 PHP is built from the ground up with no third-party runtime dependencies in core. The framework requires only PHP 8.2+ with `openssl` and `json` extensions. Database drivers are optional and installed separately. This keeps the full deployment under 8 MB and minimizes your project's carbon footprint.
+
+---
+
+## Demo Store
+
+A complete e-commerce app lives in `example/`. It demonstrates every framework feature through a real-world use case.
+
+```bash
+cd example
+bash setup.sh          # macOS/Linux
+# or: setup.bat        # Windows
+php index.php
 ```
+
+Open http://localhost:7145
+
+| Role | Email | Password |
+|------|-------|----------|
+| Admin | admin@tina4store.com | admin123 |
+| Customer | alice@example.com | customer123 |
+
+See [`example/README.md`](example/README.md) for full details.
+
+---
+
+## Documentation
+
+Full guides, API reference, and examples at **[tina4.com](https://tina4.com)**.
+
+## License
+
+MIT (c) 2007-2026 Tina4 Stack
+https://opensource.org/licenses/MIT
+
+---
+
+<p align="center"><b>Tina4: The Intelligent Native Application 4ramework</b><br>Simple. Fast. Human. &middot; Built for AI. Built for you.</p>
+
+---
+
+## Our Sponsors
+
+**Sponsored with :blue_heart: by Code Infinity**
+
+[<img src="https://codeinfinity.co.za/wp-content/uploads/2025/09/c8e-logo-github.png" alt="Code Infinity" width="100">](https://codeinfinity.co.za/about-open-source-policy?utm_source=github&utm_medium=website&utm_campaign=opensource_campaign&utm_id=opensource)
+
+*Supporting open source communities <span style="color: #1DC7DE;">*</span> Innovate <span style="color: #1DC7DE;">*</span> Code <span style="color: #1DC7DE;">*</span> Empower*

@@ -1,0 +1,804 @@
+<?php
+
+/**
+ * Tina4 — The Intelligent Native Application 4ramework
+ * Copyright 2007 - current Tina4
+ * License: MIT https://opensource.org/licenses/MIT
+ */
+
+namespace Tina4;
+
+/**
+ * Session management with pluggable backends — zero external dependencies.
+ *
+ * Supported backends:
+ *   - 'file' — JSON files in a configurable directory (default: data/sessions)
+ *   - 'redis' — Redis via PHP's built-in redis extension
+ *   - 'database' / 'db' — SQL database via Tina4 DatabaseAdapter
+ *
+ * Environment variables:
+ *   TINA4_SESSION_HANDLER  — 'file', 'redis', 'valkey', 'mongodb', or 'database' (default: 'file')
+ *   TINA4_SESSION_PATH     — file storage path (default: 'data/sessions')
+ *   TINA4_SESSION_TTL      — session lifetime in seconds (default: 3600)
+ *   TINA4_SESSION_REDIS_URL — Redis connection URL (default: 'tcp://127.0.0.1:6379')
+ */
+class Session
+{
+    /** @var string Session handler type ('file', 'redis', 'valkey', 'mongodb', or 'database') */
+    private string $backend;
+
+    /** @var string Current session ID */
+    private string $sessionId = '';
+
+    /** @var array Session data store */
+    private array $data = [];
+
+    /** @var int TTL in seconds */
+    private int $ttl;
+
+    /** @var string File storage path (for file backend) */
+    private string $storagePath;
+
+    /** @var bool Whether a session is active */
+    private bool $started = false;
+
+    /** @var bool Whether the data store has unsaved changes (retained across a failed save for retry) */
+    private bool $dirty = false;
+
+    /**
+     * @var bool Strict mode — when true a backend read/write/destroy/gc failure
+     *           RE-RAISES instead of logging + degrading. Set via TINA4_SESSION_STRICT.
+     */
+    private bool $strict = false;
+
+    /**
+     * @param string $backend 'file' or 'redis'
+     * @param array  $config  Override defaults: 'path', 'ttl', 'redis_url'
+     */
+    public function __construct(string $backend = '', array $config = [])
+    {
+        $this->backend = $backend ?: (getenv('TINA4_SESSION_HANDLER') ?: (getenv('TINA4_SESSION_BACKEND') ?: 'file'));
+        $this->ttl = (int)($config['ttl'] ?? getenv('TINA4_SESSION_TTL') ?: 3600);
+        $this->storagePath = $config['path'] ?? (getenv('TINA4_SESSION_PATH') ?: 'data/sessions');
+        $this->strict = DotEnv::isTruthy(DotEnv::getEnv('TINA4_SESSION_STRICT', 'false'));
+    }
+
+    /**
+     * Start or resume a session.
+     *
+     * @param string|null $sessionId Existing session ID, or null to generate one
+     * @return string The session ID
+     */
+    public function start(?string $sessionId = null): string
+    {
+        if ($sessionId !== null) {
+            $this->sessionId = $sessionId;
+            $this->load();
+        } else {
+            $this->sessionId = bin2hex(random_bytes(16));
+            $this->data = ['_meta' => ['created_at' => time(), 'last_accessed' => time()]];
+        }
+
+        $this->started = true;
+        return $this->sessionId;
+    }
+
+    /**
+     * Get a value from the session.
+     *
+     * @param string $key     The key to retrieve
+     * @param mixed  $default Default value if key not found
+     * @return mixed
+     */
+    public function get(string $key, mixed $default = null): mixed
+    {
+        return $this->data[$key] ?? $default;
+    }
+
+    /**
+     * Set a value in the session.
+     *
+     * @param string $key   The key to set
+     * @param mixed  $value The value to store
+     */
+    public function set(string $key, mixed $value): void
+    {
+        $this->data[$key] = $value;
+        $this->data['_meta']['last_accessed'] = time();
+        $this->dirty = true;
+        $this->save();
+    }
+
+    /**
+     * Delete a key from the session.
+     *
+     * @param string $key The key to remove
+     */
+    public function delete(string $key): void
+    {
+        unset($this->data[$key]);
+        $this->dirty = true;
+        $this->save();
+    }
+
+    /**
+     * Destroy the entire session and remove stored data.
+     */
+    public function destroy(): void
+    {
+        $this->data = [];
+        $this->removeStorage();
+        $this->started = false;
+    }
+
+    /**
+     * Clear all session data (but keep the session alive).
+     * Maps to Python: clear()
+     */
+    public function clear(): void
+    {
+        $meta = $this->data['_meta'] ?? null;
+        $this->data = [];
+        if ($meta !== null) {
+            $this->data['_meta'] = $meta;
+        }
+        $this->dirty = true;
+        $this->save();
+    }
+
+    /**
+     * Get all session data (excluding internal metadata).
+     *
+     * @return array
+     */
+    public function all(): array
+    {
+        $result = $this->data;
+        unset($result['_meta']);
+
+        // Exclude flash data from all()
+        foreach (array_keys($result) as $key) {
+            if (str_starts_with($key, '_flash_')) {
+                unset($result[$key]);
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Check if a key exists in the session.
+     *
+     * @param string $key The key to check
+     * @return bool
+     */
+    public function has(string $key): bool
+    {
+        return array_key_exists($key, $this->data);
+    }
+
+    /**
+     * Regenerate the session ID, preserving data.
+     *
+     * Call this immediately after a successful login or any privilege change:
+     * issuing a fresh session ID on authentication is the standard defence
+     * against session-fixation attacks (an attacker who planted a known ID
+     * before login can no longer ride the authenticated session).
+     *
+     * @return string The new session ID
+     */
+    public function regenerate(): string
+    {
+        $oldData = $this->data;
+        $oldId = $this->sessionId;
+
+        $this->sessionId = bin2hex(random_bytes(16));
+        $this->data = $oldData;
+        $this->data['_meta']['last_accessed'] = time();
+        $this->dirty = true;
+        $this->save();
+
+        // Best-effort removal of the old record (log + swallow on failure).
+        $this->safeDestroy($oldId);
+
+        return $this->sessionId;
+    }
+
+    /**
+     * Set flash data — available only until the next read.
+     *
+     * @param string $key   The flash key
+     * @param mixed  $value The flash value
+     */
+    /**
+     * Dual-mode flash: set with value, get+remove without.
+     *
+     *   $session->flash("message", "Saved!")  // set
+     *   $session->flash("message")            // get + auto-remove → "Saved!"
+     */
+    public function flash(string $key, mixed $value = null): mixed
+    {
+        $flashKey = "_flash_$key";
+        if ($value !== null) {
+            // Set mode
+            $this->data[$flashKey] = $value;
+            $this->dirty = true;
+            $this->save();
+            return null;
+        }
+        // Get mode — read and remove
+        if (!array_key_exists($flashKey, $this->data)) {
+            return null;
+        }
+
+        $value = $this->data[$flashKey];
+        unset($this->data[$flashKey]);
+        $this->dirty = true;
+        $this->save();
+
+        return $value;
+    }
+
+    /**
+     * Get flash data by key (alias for flash(key) without value).
+     */
+    public function getFlash(string $key, mixed $default = null): mixed
+    {
+        $result = $this->flash($key);
+        return $result !== null ? $result : $default;
+    }
+
+    /**
+     * Get the current session ID.
+     *
+     * @return string
+     */
+    public function getSessionId(): string
+    {
+        return $this->sessionId;
+    }
+
+    /**
+     * Return a Set-Cookie header value for this session.
+     *
+     * Env var overrides (only consulted when the caller passes the default
+     * cookie name "tina4_session" — explicit names from callers always win):
+     *   TINA4_SESSION_NAME      — cookie name (default: "tina4_session")
+     *   TINA4_SESSION_HTTPONLY  — emit HttpOnly attr (default: "true")
+     *   TINA4_SESSION_SECURE    — emit Secure attr (default: "false"; SameSite=None forces it on)
+     *   TINA4_SESSION_SAMESITE  — SameSite attr (default: "Lax")
+     */
+    public function cookieHeader(string $cookieName = 'tina4_session'): string
+    {
+        // Honor env-defined cookie name only if the caller didn't override.
+        if ($cookieName === 'tina4_session') {
+            $envName = DotEnv::getEnv('TINA4_SESSION_NAME');
+            if ($envName !== null && $envName !== '') {
+                $cookieName = $envName;
+            }
+        }
+
+        $sameSite = DotEnv::getEnv('TINA4_SESSION_SAMESITE') ?: 'Lax';
+
+        $httpOnly = DotEnv::isTruthy(DotEnv::getEnv('TINA4_SESSION_HTTPONLY', 'true'));
+        // SameSite=None requires Secure per RFC — silently flip Secure on.
+        $secure = DotEnv::isTruthy(DotEnv::getEnv('TINA4_SESSION_SECURE', 'false'))
+            || strcasecmp($sameSite, 'None') === 0;
+
+        $parts = ["{$cookieName}={$this->sessionId}", "Path=/"];
+        if ($httpOnly) {
+            $parts[] = 'HttpOnly';
+        }
+        if ($secure) {
+            $parts[] = 'Secure';
+        }
+        $parts[] = "SameSite={$sameSite}";
+        $parts[] = "Max-Age={$this->ttl}";
+
+        return implode('; ', $parts);
+    }
+
+    /**
+     * Check if the session is started.
+     *
+     * @return bool
+     */
+    public function isStarted(): bool
+    {
+        return $this->started;
+    }
+
+    /**
+     * Read raw session data for a given session ID from the backend storage.
+     *
+     * @param string $sessionId The session ID to read
+     * @return array|null The session data array, or null if not found / expired
+     */
+    public function read(string $sessionId): ?array
+    {
+        $previousId = $this->sessionId;
+        $previousData = $this->data;
+
+        $this->sessionId = $sessionId;
+        $this->load();
+        $result = $this->data;
+
+        $this->sessionId = $previousId;
+        $this->data = $previousData;
+
+        // Return null if only empty or default meta (session not found)
+        if (empty($result) || $result === ['_meta' => $result['_meta'] ?? []]) {
+            $keys = array_keys($result);
+            $nonMeta = array_filter($keys, fn($k) => $k !== '_meta');
+            if (empty($nonMeta)) {
+                // Check if the meta looks freshly initialised (created_at == last_accessed ~now)
+                $meta = $result['_meta'] ?? [];
+                if (isset($meta['created_at']) && abs($meta['created_at'] - $meta['last_accessed']) < 2) {
+                    return null;
+                }
+            }
+        }
+
+        return $result ?: null;
+    }
+
+    /**
+     * Write raw session data for a given session ID to the backend storage.
+     *
+     * @param string $sessionId The session ID to write
+     * @param array  $data      The session data to store
+     * @param int    $ttl       Optional TTL override in seconds (0 = use instance TTL)
+     */
+    public function write(string $sessionId, array $data, int $ttl = 0): void
+    {
+        $previousId = $this->sessionId;
+        $previousData = $this->data;
+        $previousTtl = $this->ttl;
+
+        $this->sessionId = $sessionId;
+        $this->data = $data;
+        if ($ttl > 0) {
+            $this->ttl = $ttl;
+        }
+
+        $this->save();
+
+        $this->sessionId = $previousId;
+        $this->data = $previousData;
+        $this->ttl = $previousTtl;
+    }
+
+    // ── Backend-failure policy (log-loud + degrade) ───────────────
+    //
+    // The policy lives HERE, at the Session boundary — one set of wrappers for
+    // every backend (file/redis/valkey/mongo/database), mirroring the Python
+    // master. A backend that throws is logged ONCE via Log::error and degraded:
+    //   read    -> empty session
+    //   write   -> best-effort (dirty flag retained for a later retry)
+    //   destroy -> swallowed
+    //   gc      -> swallowed
+    // A genuinely empty session (the backend returns no data WITHOUT throwing)
+    // is NOT a failure and is never logged. TINA4_SESSION_STRICT=true re-raises.
+
+    /**
+     * Read raw data for $sessionId via the backend; log + degrade to an empty
+     * session on failure (or re-raise when strict).
+     */
+    private function safeRead(string $sessionId): void
+    {
+        try {
+            $this->dispatchLoad();
+        } catch (\Throwable $e) {
+            Log::error(
+                "Session read failed ({$this->handlerLabel()}): " . $e->getMessage()
+            );
+            if ($this->strict) {
+                throw $e;
+            }
+            // Degrade — start from an empty, writable session.
+            $this->data = ['_meta' => ['created_at' => time(), 'last_accessed' => time()]];
+        }
+    }
+
+    /**
+     * Persist the current data via the backend.
+     *
+     * @return bool true on success; false (after logging) on a degraded write,
+     *              with the dirty flag left set so a later save() can retry.
+     */
+    private function safeWrite(): bool
+    {
+        try {
+            $this->dispatchSave();
+            return true;
+        } catch (\Throwable $e) {
+            Log::error(
+                "Session write failed ({$this->handlerLabel()}): " . $e->getMessage()
+            );
+            if ($this->strict) {
+                throw $e;
+            }
+            return false;
+        }
+    }
+
+    /**
+     * Remove $sessionId from the backend; log + swallow on failure (or re-raise
+     * when strict).
+     */
+    private function safeDestroy(string $sessionId): bool
+    {
+        $previousId = $this->sessionId;
+        $this->sessionId = $sessionId;
+        try {
+            $this->dispatchRemove();
+            return true;
+        } catch (\Throwable $e) {
+            Log::error(
+                "Session destroy failed ({$this->handlerLabel()}): " . $e->getMessage()
+            );
+            if ($this->strict) {
+                throw $e;
+            }
+            return false;
+        } finally {
+            $this->sessionId = $previousId;
+        }
+    }
+
+    /**
+     * Human-readable label for the active backend handler (for log messages).
+     */
+    private function handlerLabel(): string
+    {
+        return match ($this->backend) {
+            'redis' => 'RedisSessionHandler',
+            'valkey' => 'ValkeySessionHandler',
+            'mongodb', 'mongo' => 'MongoSessionHandler',
+            'database', 'db' => 'DatabaseSessionHandler',
+            default => 'FileSessionHandler',
+        };
+    }
+
+    // ── Storage Operations ────────────────────────────────────────
+
+    /**
+     * Load session data from the backend (applies the log-loud + degrade policy).
+     */
+    private function load(): void
+    {
+        $this->safeRead($this->sessionId);
+    }
+
+    /**
+     * Raw backend dispatch for a load — may throw; the policy lives in safeRead().
+     */
+    private function dispatchLoad(): void
+    {
+        match ($this->backend) {
+            'redis' => $this->loadFromRedis(),
+            'valkey' => $this->loadFromValkey(),
+            'mongodb', 'mongo' => $this->loadFromMongo(),
+            'database', 'db' => $this->loadFromDatabase(),
+            default => $this->loadFromFile(),
+        };
+    }
+
+    /**
+     * Save session data to the backend.
+     *
+     * Honours the log-loud + degrade policy: on a successful write the dirty
+     * flag is cleared; on a degraded write it is retained so a later save()
+     * retries the same data. Returns true on success, false on a degraded write.
+     */
+    public function save(): bool
+    {
+        if ($this->safeWrite()) {
+            $this->dirty = false;
+            return true;
+        }
+        // Write failed — keep dirty set for a later retry (do not crash).
+        return false;
+    }
+
+    /**
+     * Raw backend dispatch for a save — may throw; the policy lives in safeWrite().
+     */
+    private function dispatchSave(): void
+    {
+        match ($this->backend) {
+            'redis' => $this->saveToRedis(),
+            'valkey' => $this->saveToValkey(),
+            'mongodb', 'mongo' => $this->saveToMongo(),
+            'database', 'db' => $this->saveToDatabase(),
+            default => $this->saveToFile(),
+        };
+    }
+
+    /**
+     * Remove session data from the backend (applies the log-loud + degrade policy).
+     */
+    private function removeStorage(): void
+    {
+        $this->safeDestroy($this->sessionId);
+    }
+
+    /**
+     * Raw backend dispatch for a remove — may throw; the policy lives in safeDestroy().
+     */
+    private function dispatchRemove(): void
+    {
+        match ($this->backend) {
+            'redis' => $this->removeFromRedis(),
+            'valkey' => $this->removeFromValkey(),
+            'mongodb', 'mongo' => $this->removeFromMongo(),
+            'database', 'db' => $this->removeFromDatabase(),
+            default => $this->removeFromFile(),
+        };
+    }
+
+    // ── Garbage Collection ─────────────────────────────────────────
+
+    /**
+     * Garbage-collect expired sessions from the backend.
+     *
+     * Only file and database backends support GC — Redis/Valkey/Mongo
+     * handle TTL-based expiry natively.
+     */
+    public function gc(int $maxLifetime = 0): void
+    {
+        if ($maxLifetime > 0) {
+            $this->ttl = $maxLifetime;
+        }
+        // log-loud + degrade: a GC failure is logged once and swallowed (or
+        // re-raised when strict) — it must never crash the caller.
+        try {
+            match ($this->backend) {
+                'database', 'db' => $this->gcDatabase(),
+                'file' => $this->gcFiles(),
+                default => null, // Redis/Valkey/Mongo handle TTL natively
+            };
+        } catch (\Throwable $e) {
+            Log::error(
+                "Session gc failed ({$this->handlerLabel()}): " . $e->getMessage()
+            );
+            if ($this->strict) {
+                throw $e;
+            }
+        }
+    }
+
+    /**
+     * Remove expired file sessions.
+     */
+    private function gcFiles(): void
+    {
+        if (!is_dir($this->storagePath)) {
+            return;
+        }
+
+        $now = time();
+        foreach (glob($this->storagePath . '/*.json') as $file) {
+            try {
+                $content = file_get_contents($file);
+                $data = json_decode($content, true);
+                if (!is_array($data)) {
+                    unlink($file);
+                    continue;
+                }
+
+                $lastAccessed = $data['_meta']['last_accessed'] ?? 0;
+                if ($lastAccessed > 0 && ($now - $lastAccessed) > $this->ttl) {
+                    unlink($file);
+                }
+            } catch (\Throwable) {
+                // Corrupt file — remove it
+                @unlink($file);
+            }
+        }
+    }
+
+    /**
+     * Remove expired database sessions.
+     */
+    private function gcDatabase(): void
+    {
+        if ($this->dbHandler !== null || class_exists(Session\DatabaseSessionHandler::class)) {
+            $this->getDbHandler()->gc($this->ttl);
+        }
+    }
+
+    // ── File Backend ──────────────────────────────────────────────
+
+    /**
+     * Get the file path for the current session.
+     */
+    private function getFilePath(): string
+    {
+        return $this->storagePath . '/' . $this->sessionId . '.json';
+    }
+
+    /**
+     * Load session data from a JSON file.
+     */
+    private function loadFromFile(): void
+    {
+        $path = $this->getFilePath();
+        if (!file_exists($path)) {
+            $this->data = ['_meta' => ['created_at' => time(), 'last_accessed' => time()]];
+            return;
+        }
+
+        $content = file_get_contents($path);
+        $decoded = json_decode($content, true);
+
+        if (!is_array($decoded)) {
+            $this->data = ['_meta' => ['created_at' => time(), 'last_accessed' => time()]];
+            return;
+        }
+
+        // Check TTL
+        $lastAccessed = $decoded['_meta']['last_accessed'] ?? 0;
+        if (time() - $lastAccessed > $this->ttl) {
+            // Session expired
+            $this->removeFromFile();
+            $this->data = ['_meta' => ['created_at' => time(), 'last_accessed' => time()]];
+            return;
+        }
+
+        $this->data = $decoded;
+        $this->data['_meta']['last_accessed'] = time();
+    }
+
+    /**
+     * Save session data to a JSON file.
+     */
+    private function saveToFile(): void
+    {
+        if (!is_dir($this->storagePath)) {
+            mkdir($this->storagePath, 0755, true);
+        }
+
+        file_put_contents(
+            $this->getFilePath(),
+            json_encode($this->data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES),
+            LOCK_EX
+        );
+    }
+
+    /**
+     * Remove the session file.
+     */
+    private function removeFromFile(): void
+    {
+        $path = $this->getFilePath();
+        if (file_exists($path)) {
+            unlink($path);
+        }
+    }
+
+    // ── Redis Backend (delegates to RedisSessionHandler) ────────
+
+    private ?Session\RedisSessionHandler $redisHandler = null;
+
+    private function getRedisHandler(): Session\RedisSessionHandler
+    {
+        if ($this->redisHandler === null) {
+            $this->redisHandler = new Session\RedisSessionHandler();
+        }
+        return $this->redisHandler;
+    }
+
+    /**
+     * Load session data from Redis.
+     */
+    private function loadFromRedis(): void
+    {
+        $data = $this->getRedisHandler()->read($this->sessionId);
+        $this->data = $data ?: ['_meta' => ['created_at' => time(), 'last_accessed' => time()]];
+        $this->data['_meta']['last_accessed'] = time();
+    }
+
+    /**
+     * Save session data to Redis.
+     */
+    private function saveToRedis(): void
+    {
+        $this->getRedisHandler()->write($this->sessionId, $this->data);
+    }
+
+    /**
+     * Remove session data from Redis.
+     */
+    private function removeFromRedis(): void
+    {
+        $this->getRedisHandler()->destroy($this->sessionId);
+    }
+
+    // ── Valkey Backend (delegates to ValkeySessionHandler) ────────
+
+    private ?Session\ValkeySessionHandler $valkeyHandler = null;
+
+    private function getValkeyHandler(): Session\ValkeySessionHandler
+    {
+        if ($this->valkeyHandler === null) {
+            $this->valkeyHandler = new Session\ValkeySessionHandler();
+        }
+        return $this->valkeyHandler;
+    }
+
+    private function loadFromValkey(): void
+    {
+        $data = $this->getValkeyHandler()->read($this->sessionId);
+        $this->data = $data ?: ['_meta' => ['created_at' => time(), 'last_accessed' => time()]];
+        $this->data['_meta']['last_accessed'] = time();
+    }
+
+    private function saveToValkey(): void
+    {
+        $this->getValkeyHandler()->write($this->sessionId, $this->data);
+    }
+
+    private function removeFromValkey(): void
+    {
+        $this->getValkeyHandler()->destroy($this->sessionId);
+    }
+
+    // ── MongoDB Backend (delegates to MongoSessionHandler) ────────
+
+    private ?Session\MongoSessionHandler $mongoHandler = null;
+
+    private function getMongoHandler(): Session\MongoSessionHandler
+    {
+        if ($this->mongoHandler === null) {
+            $this->mongoHandler = new Session\MongoSessionHandler();
+        }
+        return $this->mongoHandler;
+    }
+
+    private function loadFromMongo(): void
+    {
+        $data = $this->getMongoHandler()->read($this->sessionId);
+        $this->data = $data ?: ['_meta' => ['created_at' => time(), 'last_accessed' => time()]];
+        $this->data['_meta']['last_accessed'] = time();
+    }
+
+    private function saveToMongo(): void
+    {
+        $this->getMongoHandler()->write($this->sessionId, $this->data);
+    }
+
+    private function removeFromMongo(): void
+    {
+        $this->getMongoHandler()->destroy($this->sessionId);
+    }
+
+    // ── Database Backend (delegates to DatabaseSessionHandler) ────
+
+    private ?Session\DatabaseSessionHandler $dbHandler = null;
+
+    private function getDbHandler(): Session\DatabaseSessionHandler
+    {
+        if ($this->dbHandler === null) {
+            $this->dbHandler = new Session\DatabaseSessionHandler();
+        }
+        return $this->dbHandler;
+    }
+
+    private function loadFromDatabase(): void
+    {
+        $data = $this->getDbHandler()->read($this->sessionId);
+        $this->data = $data ?: ['_meta' => ['created_at' => time(), 'last_accessed' => time()]];
+        $this->data['_meta']['last_accessed'] = time();
+    }
+
+    private function saveToDatabase(): void
+    {
+        $this->getDbHandler()->write($this->sessionId, $this->data);
+    }
+
+    private function removeFromDatabase(): void
+    {
+        $this->getDbHandler()->destroy($this->sessionId);
+    }
+}

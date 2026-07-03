@@ -1,0 +1,1872 @@
+#!/usr/bin/env php
+<?php
+/**
+ * Tina4 PHP CLI — v3
+ *
+ * Usage:
+ *   tina4php init [dir]             Scaffold a new project
+ *   tina4php serve [host:port|port]  Start dev server (default: 0.0.0.0:7145)
+ *   tina4php start [host:port|port] Alias for serve
+ *   tina4php migrate                Run pending migrations
+ *   tina4php migrate:create <desc>  Create a migration file
+ *   tina4php migrate:rollback       Rollback last batch
+ *   tina4php migrate:status         Show migration status
+ *   tina4php seed                   Run seeders from src/seeds/
+ *   tina4php routes                 List all registered routes
+ *   tina4php metrics [opts]         Rank top code-quality offenders (--top N, --json, --fail-on, --path)
+ *   tina4php test                   Run test suite
+ *   tina4php build                  Build distributable package
+ *   tina4php generate <what> <name>  Generate scaffolding
+ *   tina4php ai [--all]             Detect AI tools and install context
+ *   tina4php console                Drop into an interactive PHP REPL with Tina4 loaded
+ *   tina4php help                   Show this help
+ *
+ * Generators:
+ *   generate model <Name> [--fields "name:string,price:float"]
+ *   generate route <name> [--model Name]
+ *   generate crud <Name> [--fields "..."]   Model + migration + routes + form + view + test
+ *   generate migration <description>
+ *   generate middleware <Name>
+ *   generate test <name>
+ *   generate form <Name> [--fields "..."]   Form template with typed inputs
+ *   generate view <Name> [--fields "..."]   List + detail templates
+ *   generate auth                           Login/register routes + User model + templates
+ *
+ * Field types: string, int, float, bool, text, datetime, blob
+ * Table names: singular by default (Product -> product)
+ *
+ * https://tina4.com
+ */
+
+// ── Resolve paths ──
+$cwd = getcwd();
+
+// Find autoloader: CWD first, then relative to this binary
+$autoloadPaths = [
+    $cwd . '/vendor/autoload.php',
+    __DIR__ . '/../vendor/autoload.php',
+    __DIR__ . '/../../autoload.php',
+];
+
+$autoloaded = false;
+foreach ($autoloadPaths as $autoloadFile) {
+    if (file_exists($autoloadFile)) {
+        require_once $autoloadFile;
+        $autoloaded = true;
+        break;
+    }
+}
+
+// Constants are auto-loaded via composer "files" autoload — no manual require needed
+
+// Framework root (where the Tina4 source lives)
+$frameworkRoot = realpath(__DIR__ . '/..');
+
+// ── Field type mapping ──
+$FIELD_TYPE_MAP = [
+    'string'   => ['php' => 'string',  'default' => "''",    'sql' => 'VARCHAR(255)', 'nullable' => false],
+    'str'      => ['php' => 'string',  'default' => "''",    'sql' => 'VARCHAR(255)', 'nullable' => false],
+    'int'      => ['php' => 'int',     'default' => 'null',  'sql' => 'INTEGER',      'nullable' => true],
+    'integer'  => ['php' => 'int',     'default' => 'null',  'sql' => 'INTEGER',      'nullable' => true],
+    'float'    => ['php' => 'float',   'default' => 'null',  'sql' => 'DECIMAL(10,2)','nullable' => true],
+    'numeric'  => ['php' => 'float',   'default' => 'null',  'sql' => 'DECIMAL(10,2)','nullable' => true],
+    'decimal'  => ['php' => 'float',   'default' => 'null',  'sql' => 'DECIMAL(10,2)','nullable' => true],
+    'bool'     => ['php' => 'bool',    'default' => 'false', 'sql' => 'TINYINT(1)',   'nullable' => false],
+    'boolean'  => ['php' => 'bool',    'default' => 'false', 'sql' => 'TINYINT(1)',   'nullable' => false],
+    'text'     => ['php' => 'string',  'default' => "''",    'sql' => 'TEXT',         'nullable' => false],
+    'datetime' => ['php' => 'string',  'default' => 'null',  'sql' => 'DATETIME',    'nullable' => true],
+    'blob'     => ['php' => 'string',  'default' => 'null',  'sql' => 'BLOB',        'nullable' => true],
+];
+
+// ── Input type mapping (for form generation) ──
+$INPUT_TYPE_MAP = [
+    'string'   => 'text',
+    'str'      => 'text',
+    'text'     => 'textarea',
+    'int'      => 'number',
+    'integer'  => 'number',
+    'float'    => 'number',
+    'numeric'  => 'number',
+    'decimal'  => 'number',
+    'bool'     => 'checkbox',
+    'boolean'  => 'checkbox',
+    'datetime' => 'datetime-local',
+    'blob'     => 'file',
+];
+
+
+// ── Helper functions ──
+
+/**
+ * CamelCase to snake_case (singular table name).
+ * ProductCategory -> product_category
+ */
+function tableNameFromClass(string $name): string
+{
+    $s1 = preg_replace('/([A-Z]+)([A-Z][a-z])/', '$1_$2', $name);
+    return strtolower(preg_replace('/([a-z0-9])([A-Z])/', '$1_$2', $s1));
+}
+
+/**
+ * Parse "name:string,price:float" into [['name','string'], ['price','float']].
+ */
+function parseFields(string $fieldsStr): array
+{
+    if (empty(trim($fieldsStr))) {
+        return [];
+    }
+    $result = [];
+    foreach (explode(',', $fieldsStr) as $part) {
+        $part = trim($part);
+        if (str_contains($part, ':')) {
+            [$name, $type] = explode(':', $part, 2);
+            $result[] = [trim($name), strtolower(trim($type))];
+        } elseif ($part !== '') {
+            $result[] = [$part, 'string'];
+        }
+    }
+    return $result;
+}
+
+/**
+ * Parse --key value and --flag from args. Returns [flags, positional].
+ */
+function parseFlags(array $args): array
+{
+    // Boolean-only flags that never take a value argument
+    $booleanFlags = ['no-browser', 'no-reload', 'production', 'managed', 'all', 'clear', 'json'];
+
+    $flags = [];
+    $positional = [];
+    $i = 0;
+    while ($i < count($args)) {
+        if (str_starts_with($args[$i], '--')) {
+            $key = substr($args[$i], 2);
+            // Check for --key=value
+            if (str_contains($key, '=')) {
+                [$key, $val] = explode('=', $key, 2);
+                $flags[$key] = $val;
+                $i++;
+            } elseif (in_array($key, $booleanFlags, true)) {
+                $flags[$key] = true;
+                $i++;
+            } elseif ($i + 1 < count($args) && !str_starts_with($args[$i + 1], '--')) {
+                $flags[$key] = $args[$i + 1];
+                $i += 2;
+            } else {
+                $flags[$key] = true;
+                $i++;
+            }
+        } else {
+            $positional[] = $args[$i];
+            $i++;
+        }
+    }
+    return [$flags, $positional];
+}
+
+/**
+ * Kill any process listening on the given port.
+ */
+function killProcessOnPort(int $port): bool
+{
+    if (PHP_OS_FAMILY === 'Windows') {
+        return false;
+    }
+    $output = @shell_exec("lsof -ti :{$port} 2>/dev/null");
+    if (!empty(trim($output ?? ''))) {
+        $pids = array_filter(explode("\n", trim($output)));
+        foreach ($pids as $pid) {
+            $pid = (int)trim($pid);
+            if ($pid > 0) {
+                @posix_kill($pid, 15); // SIGTERM
+            }
+        }
+        usleep(500000); // 0.5s
+        echo "  Warning: Killed existing process on port {$port} (PID: " . implode(', ', $pids) . ")\n";
+        return true;
+    }
+    return false;
+}
+
+
+// ── Port/host resolution ──
+// Priority: CLI arg > ENV var > default
+// Extracted as a function so it can be unit-tested.
+function resolveHostPort(?string $cliArg = null): array
+{
+    $defaultHost = '0.0.0.0';
+    $defaultPort = '7145';
+
+    $host = null;
+    $port = null;
+
+    // 1. CLI argument (highest priority)
+    if ($cliArg !== null && $cliArg !== '') {
+        if (str_contains($cliArg, ':')) {
+            [$host, $port] = explode(':', $cliArg, 2);
+        } else {
+            $port = $cliArg;
+        }
+    }
+
+    // 2. ENV vars (fill in anything not set by CLI)
+    if ($host === null) {
+        $envHost = getenv('HOST');
+        if ($envHost !== false && $envHost !== '') {
+            $host = $envHost;
+        }
+    }
+    if ($port === null) {
+        $envPort = getenv('TINA4_PORT') ?: getenv('PORT');
+        if ($envPort !== false && $envPort !== '') {
+            $port = $envPort;
+        }
+    }
+
+    // 3. Defaults
+    $host = $host ?? $defaultHost;
+    $port = $port ?? $defaultPort;
+
+    return [$host, $port];
+}
+
+// ── Parse command ──
+$command = $argv[1] ?? 'help';
+$args = array_slice($argv, 2);
+
+switch ($command) {
+
+    // ────────────────────────────────────────────
+    // INIT — Scaffold a new project
+    // ────────────────────────────────────────────
+    case 'init':
+        $targetDir = isset($args[0]) ? realpath($args[0]) ?: $args[0] : $cwd;
+
+        // Create target if it doesn't exist
+        if (!is_dir($targetDir)) {
+            mkdir($targetDir, 0755, true);
+        }
+        $targetDir = realpath($targetDir) . DIRECTORY_SEPARATOR;
+
+        // Create directories
+        $dirs = [
+            'src/routes', 'src/templates', 'src/templates/errors',
+            'src/orm', 'src/public', 'src/public/css', 'src/public/js',
+            'src/scss', 'src/services', 'src/app', 'src/locales', 'src/seeds',
+            'migrations', 'logs',
+        ];
+        foreach ($dirs as $dir) {
+            $full = $targetDir . str_replace('/', DIRECTORY_SEPARATOR, $dir);
+            if (!is_dir($full)) {
+                mkdir($full, 0755, true);
+                echo "  Created {$dir}/\n";
+            }
+        }
+
+        // Copy framework public assets into the project so they're visible
+        $frameworkPublic = __DIR__ . DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR . 'src' . DIRECTORY_SEPARATOR . 'public' . DIRECTORY_SEPARATOR;
+        $projectPublic = $targetDir . 'src' . DIRECTORY_SEPARATOR . 'public' . DIRECTORY_SEPARATOR;
+        $assetsToCopy = [
+            'css' . DIRECTORY_SEPARATOR . 'tina4.css',
+            'css' . DIRECTORY_SEPARATOR . 'tina4.min.css',
+            'js' . DIRECTORY_SEPARATOR . 'tina4.min.js',
+            'js' . DIRECTORY_SEPARATOR . 'frond.min.js',
+            'images' . DIRECTORY_SEPARATOR . 'tina4-logo-icon.webp',
+        ];
+        foreach ($assetsToCopy as $asset) {
+            $src = $frameworkPublic . $asset;
+            $dst = $projectPublic . $asset;
+            $dstDir = dirname($dst);
+            if (!is_dir($dstDir)) {
+                mkdir($dstDir, 0755, true);
+            }
+            if (file_exists($src) && !file_exists($dst)) {
+                copy($src, $dst);
+                echo "  Copied {$asset}\n";
+            }
+        }
+
+        // Create index.php
+        if (!file_exists($targetDir . 'index.php')) {
+            $indexContent = <<<'PHP'
+<?php
+require_once "./vendor/autoload.php";
+
+$app = new \Tina4\App(basePath: __DIR__);
+$app->handle();
+PHP;
+            file_put_contents($targetDir . 'index.php', $indexContent);
+            echo "  Created index.php\n";
+        }
+
+        // Create composer.json
+        if (!file_exists($targetDir . 'composer.json')) {
+            $composerContent = json_encode([
+                'name' => 'tina4/my-project',
+                'require' => [
+                    'tina4stack/tina4-php' => '^3.0',
+                ],
+                'autoload' => [
+                    'psr-4' => [
+                        '' => 'src/app/',
+                    ],
+                ],
+            ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+            file_put_contents($targetDir . 'composer.json', $composerContent);
+            echo "  Created composer.json\n";
+        }
+
+        // Create .env
+        if (!file_exists($targetDir . '.env')) {
+            file_put_contents($targetDir . '.env', "TINA4_DEBUG=true\nTINA4_DEBUG_LEVEL=ALL\n");
+            echo "  Created .env\n";
+        }
+
+        // Create .gitignore
+        if (!file_exists($targetDir . '.gitignore')) {
+            file_put_contents($targetDir . '.gitignore', "vendor/\nlogs/\n*.db\n.env\n.env.local\nnode_modules/\n");
+            echo "  Created .gitignore\n";
+        }
+
+        // Create Dockerfile
+        if (!file_exists($targetDir . 'Dockerfile')) {
+            $dockerfile = <<<'DOCKERFILE'
+# Build stage
+FROM php:8.4-cli AS build
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y unzip git \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+COPY --from=mlocati/php-extension-installer /usr/bin/install-php-extensions /usr/bin/install-php-extensions
+RUN install-php-extensions sqlite3 opcache
+
+COPY composer.json composer.lock* ./
+RUN composer install --no-dev --optimize-autoloader --no-scripts
+COPY . .
+
+# Runtime stage
+FROM php:8.4-cli
+WORKDIR /app
+
+COPY --from=mlocati/php-extension-installer /usr/bin/install-php-extensions /usr/bin/install-php-extensions
+RUN install-php-extensions sqlite3 opcache
+
+COPY --from=build /app .
+
+ENV HOST=0.0.0.0
+ENV PORT=7145
+EXPOSE 7145
+CMD ["php", "bin/tina4php", "serve", "--host", "0.0.0.0", "--port", "7145"]
+DOCKERFILE;
+            file_put_contents($targetDir . 'Dockerfile', $dockerfile);
+            echo "  Created Dockerfile\n";
+        }
+
+        // Create .dockerignore
+        if (!file_exists($targetDir . '.dockerignore')) {
+            file_put_contents($targetDir . '.dockerignore', "vendor\n.git\n.claude\n.env\n*.log\ntests\ntmp\n");
+            echo "  Created .dockerignore\n";
+        }
+
+        echo "\nProject initialized in {$targetDir}\n";
+        echo "  cd {$targetDir}\n";
+        echo "  composer install\n";
+        echo "  vendor/bin/tina4php serve\n";
+        break;
+
+    // ────────────────────────────────────────────
+    // SERVE / START — Start PHP built-in server
+    // ────────────────────────────────────────────
+    case 'serve':
+    case 'start':
+        // Load .env BEFORE port resolution so TINA4_PORT from .env is visible to getenv()
+        $envFile = $cwd . DIRECTORY_SEPARATOR . '.env';
+        if (is_file($envFile) && class_exists('\Tina4\DotEnv')) {
+            \Tina4\DotEnv::loadEnv($envFile);
+        }
+        // Load .env.local AFTER .env as an override (gitignored local overrides).
+        $envLocalFile = $cwd . DIRECTORY_SEPARATOR . '.env.local';
+        if (is_file($envLocalFile) && class_exists('\Tina4\DotEnv')) {
+            \Tina4\DotEnv::loadEnv($envLocalFile, overwrite: true);
+        }
+
+        // Parse flags from $args
+        [$serveFlags, $servePositional] = parseFlags($args);
+        $flagPort = $serveFlags['port'] ?? null;
+        $flagHost = $serveFlags['host'] ?? null;
+        $noBrowser = isset($serveFlags['no-browser']);
+        $noReload = isset($serveFlags['no-reload']);
+        $isProduction = isset($serveFlags['production']);
+
+        if ($noReload) {
+            putenv('TINA4_NO_RELOAD=true');
+            $_ENV['TINA4_NO_RELOAD'] = 'true';
+        }
+        $positionalArg = $servePositional[0] ?? null;
+
+        [$host, $port] = resolveHostPort($positionalArg);
+        if ($flagPort !== null) {
+            $port = $flagPort;
+        }
+        if ($flagHost !== null) {
+            $host = $flagHost;
+        }
+        $port = (int)$port;
+
+        // Kill existing process on port
+        killProcessOnPort($port);
+
+        // Find index.php
+        if (file_exists($cwd . '/index.php')) {
+            $docRoot = $cwd;
+        } else {
+            echo "Error: No index.php found in {$cwd}\n";
+            echo "Run 'tina4php init' first.\n";
+            exit(1);
+        }
+
+        // Only use colors when stdout is a TTY
+        $isTty = function_exists('posix_isatty') ? posix_isatty(STDOUT) : (getenv('TERM') !== false);
+        $color = $isTty ? "\e[35m" : "";
+        $reset = $isTty ? "\e[0m" : "";
+
+        $isDebug = class_exists('\Tina4\DotEnv') ? \Tina4\DotEnv::isTruthy(\Tina4\DotEnv::getEnv('TINA4_DEBUG', 'false')) : false;
+        $logLevel = (class_exists('\Tina4\DotEnv') ? \Tina4\DotEnv::getEnv('TINA4_LOG_LEVEL', 'DEBUG') : 'DEBUG');
+
+        // Detect server mode
+        $serverName = 'tina4-server';
+        $useFrankenPHP = false;
+
+        if ($isProduction) {
+            // Check for FrankenPHP only when --production is explicitly requested
+            $frankenphp = trim(shell_exec('which frankenphp 2>/dev/null') ?? '');
+            if (!empty($frankenphp)) {
+                $serverName = 'frankenphp';
+                $useFrankenPHP = true;
+            }
+        }
+
+        // Bootstrap the application — include user's index.php if available so that
+        // any initialisation code (DB setup, ORM binding, etc.) runs before the server
+        // starts. TINA4_CLI_SERVE tells App::run() to skip starting its own server.
+        if (!defined('TINA4_CLI_SERVE')) {
+            define('TINA4_CLI_SERVE', true);
+        }
+        if (file_exists($cwd . '/index.php')) {
+            ob_start();
+            include_once $cwd . '/index.php';
+            ob_end_clean();
+        } else {
+            $app = new \Tina4\App(basePath: $cwd, development: $isDebug);
+            $app->start();
+        }
+        $wsRoutes = \Tina4\Router::getWebSocketRoutes();
+        $wsInfo = count($wsRoutes) > 0 ? ' (WebSocket: ' . count($wsRoutes) . ' routes)' : '';
+
+        echo "{$color}
+  ______ _             __ __
+ /_  __/(_)___  ____ _/ // /
+  / /  / / __ \\/ __ \`/ // /_
+ / /  / / / / / /_/ /__  __/
+/_/  /_/_/ /_/\\__,_/  /_/
+{$reset}
+  Tina4 PHP v" . \Tina4\App::$VERSION . " — The Intelligent Native Application 4ramework
+
+  Server:    http://{$host}:{$port} ({$serverName}){$wsInfo}
+  Swagger:   http://localhost:{$port}/swagger
+  Dashboard: http://localhost:{$port}/__dev
+  Debug:     " . ($isDebug ? 'ON' : 'OFF') . " (Log level: {$logLevel})
+";
+
+        // Open browser unless --no-browser or TINA4_NO_BROWSER env
+        $envNoBrowser = in_array(strtolower(getenv('TINA4_NO_BROWSER') ?: ''), ['true', '1', 'yes'], true);
+        if (!$noBrowser && !$envNoBrowser && $isDebug && PHP_OS_FAMILY !== 'Windows') {
+            $browserUrl = "http://localhost:{$port}";
+            if (PHP_OS_FAMILY === 'Darwin') {
+                @exec("open " . escapeshellarg($browserUrl) . " 2>/dev/null &");
+            } else {
+                @exec("xdg-open " . escapeshellarg($browserUrl) . " 2>/dev/null &");
+            }
+        }
+
+        if ($useFrankenPHP) {
+            // FrankenPHP for production — natively supports WebSocket
+            passthru("frankenphp php-server --listen :{$port} --root " . escapeshellarg($docRoot));
+        } else {
+            // Custom Tina4 server with HTTP + WebSocket support
+            try {
+                $server = new \Tina4\Server($host, $port);
+                $server->start();
+            } catch (\RuntimeException $e) {
+                // Fallback to PHP built-in server (no WebSocket support)
+                echo "  Warning: Custom server failed, falling back to php -S (no WebSocket support)\n";
+                echo "  Reason: {$e->getMessage()}\n\n";
+
+                $extraArgs = '';
+                if (!$isDebug && (function_exists('opcache_get_status') || extension_loaded('Zend OPcache'))) {
+                    $extraArgs = ' -d opcache.enable=1 -d opcache.enable_cli=1 -d opcache.jit=1255 -d opcache.jit_buffer_size=128M';
+                }
+
+                passthru("php{$extraArgs} -S {$host}:{$port} -t " . escapeshellarg($docRoot) . " " . escapeshellarg($docRoot . '/index.php'));
+            }
+        }
+        break;
+
+    // ────────────────────────────────────────────
+    // MIGRATE — Run/create/rollback migrations
+    // ────────────────────────────────────────────
+    case 'migrate':
+        if ($autoloaded && file_exists($cwd . '/index.php')) {
+            // Load the project to get $DBA
+            ob_start();
+            include_once $cwd . '/index.php';
+            ob_end_clean();
+        }
+        $migrationsDir = $cwd . '/migrations';
+        if (!is_dir($migrationsDir)) {
+            mkdir($migrationsDir, 0755, true);
+        }
+        if (class_exists('\Tina4\Migration')) {
+            $db = \Tina4\App::getDatabase();
+            if ($db === null) {
+                // Try to create from DATABASE_URL env
+                $dbUrl = getenv('DATABASE_URL') ?: (\Tina4\DotEnv::getEnv('DATABASE_URL', '') ?? '');
+                if (!empty($dbUrl)) {
+                    $db = \Tina4\Database\Database::create($dbUrl);
+                    \Tina4\App::setDatabase($db);
+                }
+            }
+            if ($db === null) {
+                echo "Error: No database configured. Set DATABASE_URL in .env\n";
+                exit(1);
+            }
+            $migration = new \Tina4\Migration($db, $migrationsDir);
+            $result = $migration->migrate();
+            if (!empty($result['applied'])) {
+                echo "Applied " . count($result['applied']) . " migration(s):\n";
+                foreach ($result['applied'] as $name) {
+                    echo "  + {$name}\n";
+                }
+            }
+            if (!empty($result['errors'])) {
+                echo "Errors:\n";
+                foreach ($result['errors'] as $name => $err) {
+                    echo "  x {$name}: {$err}\n";
+                }
+                // FAIL-FAST: the explicit migrate CLI exits non-zero on any
+                // migration failure so CI gets a failing exit code. (The
+                // startup auto-migrate hook in App::start() swallows instead —
+                // a bad migration must never take the running service down.)
+                exit(1);
+            }
+            if (empty($result['applied']) && empty($result['errors'])) {
+                echo "No pending migrations.\n";
+            }
+        } else {
+            echo "Migration class not available.\n";
+        }
+        break;
+
+    case 'migrate:create':
+        $name = implode(' ', $args) ?: 'unnamed_migration';
+        $migrationsDir = $cwd . '/migrations';
+        if (!is_dir($migrationsDir)) {
+            mkdir($migrationsDir, 0755, true);
+        }
+        // Create migration file — no database needed
+        $timestamp = date('YmdHis');
+        $safeName = preg_replace('/[^a-z0-9_]+/', '_', strtolower(trim($name)));
+        $fileName = "{$timestamp}_{$safeName}.sql";
+        $filePath = $migrationsDir . '/' . $fileName;
+        file_put_contents($filePath, "-- Migration: {$name}\n-- Created: " . date('Y-m-d H:i:s') . "\n\n");
+        echo "Created: migrations/{$fileName}\n";
+        break;
+
+    case 'migrate:rollback':
+        if ($autoloaded && file_exists($cwd . '/index.php')) {
+            ob_start();
+            include_once $cwd . '/index.php';
+            ob_end_clean();
+        }
+        $migrationsDir = $cwd . '/migrations';
+        if (!is_dir($migrationsDir)) {
+            mkdir($migrationsDir, 0755, true);
+        }
+        if (class_exists('\Tina4\Migration')) {
+            $db = \Tina4\App::getDatabase();
+            if ($db === null) {
+                $dbUrl = getenv('DATABASE_URL') ?: (\Tina4\DotEnv::getEnv('DATABASE_URL', '') ?? '');
+                if (!empty($dbUrl)) {
+                    $db = \Tina4\Database\Database::create($dbUrl);
+                    \Tina4\App::setDatabase($db);
+                }
+            }
+            if ($db === null) {
+                echo "Error: No database configured. Set DATABASE_URL in .env\n";
+                exit(1);
+            }
+            $migration = new \Tina4\Migration($db, $migrationsDir);
+            $result = $migration->rollback();
+
+            if (empty($result['rolledBack']) && empty($result['errors'])) {
+                echo "Nothing to rollback.\n";
+            } else {
+                foreach ($result['rolledBack'] as $name) {
+                    echo "  Rolled back: {$name}\n";
+                }
+                foreach ($result['errors'] as $name => $error) {
+                    echo "  Error rolling back {$name}: {$error}\n";
+                }
+                $count = count($result['rolledBack']);
+                echo "\n{$count} migration(s) rolled back.\n";
+            }
+        } else {
+            echo "Migration class not available.\n";
+        }
+        break;
+
+    case 'migrate:status':
+        if ($autoloaded && file_exists($cwd . '/index.php')) {
+            ob_start();
+            include_once $cwd . '/index.php';
+            ob_end_clean();
+        }
+        $migrationsDir = $cwd . '/migrations';
+        if (!is_dir($migrationsDir)) {
+            mkdir($migrationsDir, 0755, true);
+        }
+        if (class_exists('\Tina4\Migration')) {
+            $migration = new \Tina4\Migration($migrationsDir);
+            $status = $migration->status();
+
+            echo "Migration Status\n";
+            echo str_repeat('=', 60) . "\n\n";
+
+            if (!empty($status['completed'])) {
+                echo "Completed:\n";
+                echo str_pad('  Migration', 45) . str_pad('Batch', 8) . "Applied At\n";
+                echo "  " . str_repeat('-', 58) . "\n";
+                foreach ($status['completed'] as $m) {
+                    echo '  ' . str_pad($m['migration'], 43) . str_pad((string)$m['batch'], 8) . ($m['applied_at'] ?? '') . "\n";
+                }
+            } else {
+                echo "Completed: (none)\n";
+            }
+
+            echo "\n";
+
+            if (!empty($status['pending'])) {
+                echo "Pending:\n";
+                foreach ($status['pending'] as $name) {
+                    echo "  {$name}\n";
+                }
+            } else {
+                echo "Pending: (none)\n";
+            }
+
+            echo "\n" . count($status['completed']) . " completed, " . count($status['pending']) . " pending.\n";
+        } else {
+            echo "Migration class not available.\n";
+        }
+        break;
+
+    // ────────────────────────────────────────────
+    // METRICS — Rank top code-quality offenders
+    // ────────────────────────────────────────────
+    case 'metrics':
+        // tina4php metrics                       Human report, scans src/ (or framework)
+        // tina4php metrics --top 10              Only the worst 10
+        // tina4php metrics --path Tina4          Scan a specific directory
+        // tina4php metrics --json                Machine-readable {summary,offenders} for CI
+        // tina4php metrics --fail-on warn        Exit 1 if any warn/error offender
+        // tina4php metrics --fail-on error       Exit 1 only on error-severity
+        [$metricsFlags, ] = parseFlags($args);
+
+        $top = (isset($metricsFlags['top']) && ctype_digit((string)$metricsFlags['top']))
+            ? (int)$metricsFlags['top'] : 20;
+        $asJson = isset($metricsFlags['json']);
+        $path = $metricsFlags['path'] ?? 'src';
+        $failOn = $metricsFlags['fail-on'] ?? null;
+        if (!in_array($failOn, [null, 'warn', 'error'], true)) {
+            fwrite(STDERR, "  invalid --fail-on '{$failOn}' (use warn or error)\n");
+            exit(2);
+        }
+
+        $result = \Tina4\Metrics::offenders($path, $top);
+        $summary = $result['summary'];
+        $found = $result['offenders'];
+
+        if (isset($summary['error'])) {
+            fwrite(STDERR, "  metrics error: {$summary['error']}\n");
+            exit(2);
+        }
+
+        // Decide exit code from the FULL offender set, not just the printed top-N.
+        // offenders()/fullAnalysis() is cached, so this reuses the same analysis.
+        $allOffenders = \Tina4\Metrics::offenders($path, max(1, $summary['total_offenders']))['offenders'];
+        $severities = array_column($allOffenders, 'severity');
+        $exitCode = 0;
+        if ($failOn === 'warn' && (in_array('warn', $severities, true) || in_array('error', $severities, true))) {
+            $exitCode = 1;
+        } elseif ($failOn === 'error' && in_array('error', $severities, true)) {
+            $exitCode = 1;
+        }
+
+        if ($asJson) {
+            echo json_encode(['summary' => $summary, 'offenders' => $found], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+            exit($exitCode);
+        }
+
+        // ── Human report ───────────────────────────────────────────
+        $useColor = function_exists('posix_isatty') ? posix_isatty(STDOUT) : (getenv('TERM') !== false);
+        $c = function (string $text, string $code) use ($useColor): string {
+            return $useColor ? "\033[{$code}m{$text}\033[0m" : $text;
+        };
+        $sevColor = ['error' => '31', 'warn' => '33', 'info' => '2']; // red / yellow / dim
+
+        echo "\n";
+        echo "  Tina4 Metrics — {$summary['scan_mode']} scan ({$summary['scan_root']})\n";
+        echo "  files: {$summary['files_analyzed']}   "
+            . "functions: {$summary['total_functions']}   "
+            . "avg complexity: {$summary['avg_complexity']}   "
+            . "avg maintainability: {$summary['avg_maintainability']}\n";
+        echo "  offenders: {$summary['total_offenders']} total"
+            . (!empty($found) ? " (showing top " . count($found) . ")" : "") . "\n";
+        echo "\n";
+
+        if (empty($found)) {
+            echo "  " . $c("\u{2713} no offenders — clean", "32") . "\n\n";
+            exit($exitCode);
+        }
+
+        // Column widths so the table lines up.
+        $locs = array_map(fn($o) => "{$o['file']}:{$o['line']}", $found);
+        $locW = max(strlen('FILE:LINE'), max(array_map('strlen', $locs)));
+        $kindW = max(strlen('KIND'), max(array_map(fn($o) => strlen($o['kind']), $found)));
+
+        $header = sprintf("  %3s  %-8s  %-{$kindW}s  %-{$locW}s  DETAIL", '#', 'SEVERITY', 'KIND', 'FILE:LINE');
+        echo $c($header, "1") . "\n";
+        echo "  " . str_repeat('-', strlen($header) - 2) . "\n";
+        foreach ($found as $i => $o) {
+            $sev = $o['severity'];
+            $sevCell = $c(sprintf("%-8s", $sev), $sevColor[$sev]);
+            echo sprintf(
+                "  %3d  %s  %-{$kindW}s  %-{$locW}s  %s\n",
+                $i + 1,
+                $sevCell,
+                $o['kind'],
+                $locs[$i],
+                $o['detail']
+            );
+        }
+        echo "\n";
+        exit($exitCode);
+
+    // ────────────────────────────────────────────
+    // ROUTES — List registered routes
+    // ────────────────────────────────────────────
+    case 'routes':
+        // Load the project
+        if (file_exists($cwd . '/index.php')) {
+            ob_start();
+            include_once $cwd . '/index.php';
+            ob_end_clean();
+        }
+        if (class_exists('\Tina4\Router')) {
+            $routes = \Tina4\Router::list();
+            echo str_pad('METHOD', 8) . str_pad('PATH', 40) . "FLAGS\n";
+            echo str_repeat('-', 60) . "\n";
+            foreach ($routes as $r) {
+                $flags = [];
+                if ($r['cache'] ?? false) $flags[] = 'CACHE';
+                if ($r['secure'] ?? false) $flags[] = 'AUTH';
+                $flagStr = $flags ? '[' . implode(', ', $flags) . ']' : '';
+                echo str_pad($r['method'], 8) . str_pad($r['pattern'], 40) . $flagStr . "\n";
+            }
+            echo str_repeat('-', 60) . "\n";
+            echo "Total: " . count($routes) . " routes\n";
+        }
+        break;
+
+    // ────────────────────────────────────────────
+    // TEST — Run tests
+    // ────────────────────────────────────────────
+    case 'test':
+        if (file_exists($cwd . '/tests/test_v3_smoke.php')) {
+            passthru('php ' . escapeshellarg($cwd . '/tests/test_v3_smoke.php'));
+        } elseif (file_exists($cwd . '/vendor/bin/phpunit')) {
+            passthru($cwd . '/vendor/bin/phpunit tests --verbose --color');
+        } else {
+            echo "No test runner found. Install phpunit or create tests/test_v3_smoke.php\n";
+        }
+        break;
+
+    // ────────────────────────────────────────────
+    // SEED — Run seeders
+    // ────────────────────────────────────────────
+    case 'seed':
+        $seedDir = $cwd . '/src/seeds';
+        if (!is_dir($seedDir)) {
+            echo "No seeds directory found at src/seeds/\n";
+            break;
+        }
+        $seeds = glob($seedDir . '/*.php');
+        if (empty($seeds)) {
+            echo "No seed files found in src/seeds/\n";
+        }
+        foreach ($seeds as $seedFile) {
+            echo "Running " . basename($seedFile) . "...\n";
+            include $seedFile;
+        }
+        break;
+
+    // ────────────────────────────────────────────
+    // BUILD — Build distributable
+    // ────────────────────────────────────────────
+    case 'build':
+        echo "Build not yet implemented in v3.\n";
+        break;
+
+    // ────────────────────────────────────────────
+    // GENERATE — Rich scaffolding (9 generators)
+    // ────────────────────────────────────────────
+    case 'generate':
+        $what = $args[0] ?? null;
+        if (!$what) {
+            echo "Usage: tina4php generate <what> <name> [options]\n";
+            echo "  Generators: model, route, crud, migration, middleware, test, form, view, auth\n";
+            echo "  Options:    --fields \"name:string,price:float\"  --model ModelName\n";
+            exit(1);
+        }
+
+        // Auth doesn't require a name argument
+        $noNameGenerators = ['auth'];
+        if (!in_array($what, $noNameGenerators) && !isset($args[1])) {
+            echo "Usage: tina4php generate {$what} <name> [options]\n";
+            exit(1);
+        }
+
+        $genName = $args[1] ?? '';
+        [$genFlags, ] = parseFlags(array_slice($args, 2));
+
+        switch ($what) {
+            case 'model':
+                generateModel($genName, $genFlags, $FIELD_TYPE_MAP);
+                break;
+            case 'route':
+                generateRoute($genName, $genFlags);
+                break;
+            case 'crud':
+                generateCrud($genName, $genFlags, $FIELD_TYPE_MAP);
+                break;
+            case 'migration':
+                generateMigration($genName, $genFlags, $FIELD_TYPE_MAP);
+                break;
+            case 'middleware':
+                generateMiddleware($genName, $genFlags);
+                break;
+            case 'test':
+                generateTest($genName, $genFlags);
+                break;
+            case 'form':
+                generateForm($genName, $genFlags);
+                break;
+            case 'view':
+                generateView($genName, $genFlags);
+                break;
+            case 'auth':
+                generateAuth($genName, $genFlags, $FIELD_TYPE_MAP);
+                break;
+            default:
+                echo "Unknown generator: {$what}\n";
+                echo "  Available: model, route, crud, migration, middleware, test, form, view, auth\n";
+                exit(1);
+        }
+        break;
+
+    // ────────────────────────────────────────────
+    // AI — Install AI context files
+    // ────────────────────────────────────────────
+    case 'ai':
+        if (isset($args[0]) && strtolower($args[0]) === 'all') {
+            \Tina4\AI::installAll($cwd);
+        } else {
+            $selection = \Tina4\AI::showMenu($cwd);
+            if ($selection) {
+                \Tina4\AI::installSelected($cwd, $selection);
+            }
+        }
+        break;
+
+    // ────────────────────────────────────────────
+    // CONSOLE — Interactive PHP REPL with Tina4 loaded
+    // ────────────────────────────────────────────
+    case 'console':
+        require_once $cwd . '/vendor/autoload.php';
+
+        // Load .env
+        \Tina4\DotEnv::loadEnv($cwd . '/.env');
+
+        // Initialize app
+        $app = new \Tina4\App(basePath: $cwd);
+
+        // Try database
+        $db = null;
+        $dbUrl = \Tina4\DotEnv::getEnv('DATABASE_URL');
+        if ($dbUrl) {
+            try {
+                $db = \Tina4\Database\Database::create($dbUrl);
+                echo "  Database: {$dbUrl}\n";
+            } catch (\Throwable $e) {
+                echo "  Database: failed ({$e->getMessage()})\n";
+            }
+        }
+
+        echo "\n  Tina4 PHP Console\n";
+        echo "  Type PHP code (without <?php). Framework is loaded.\n";
+        echo "  Available: \$db, \$app, Router, ORM, Auth, Api\n";
+        echo "  Exit: Ctrl+D or exit\n\n";
+
+        // Simple REPL loop
+        while (true) {
+            $line = readline('tina4> ');
+            if ($line === false) break;
+            if (trim($line) === 'exit') break;
+            readline_add_history($line);
+            try {
+                eval($line . ';');
+                echo "\n";
+            } catch (\Throwable $e) {
+                echo "Error: " . $e->getMessage() . "\n";
+            }
+        }
+        break;
+
+    // ────────────────────────────────────────────
+    // HELP
+    // ────────────────────────────────────────────
+    case 'help':
+    case '--help':
+    case '-h':
+    default:
+        echo "Tina4 PHP CLI v3\n\n";
+        echo "Usage: tina4php <command> [options]\n\n";
+        echo "Commands:\n";
+        echo "  init [dir]              Scaffold a new project\n";
+        echo "  serve [host:port|port]   Start dev server (default: 0.0.0.0:7145)\n";
+        echo "  start [host:port|port]   Alias for serve\n";
+        echo "  migrate                 Run pending migrations\n";
+        echo "  migrate:create <desc>   Create a migration file\n";
+        echo "  migrate:rollback        Rollback last batch\n";
+        echo "  migrate:status          Show migration status\n";
+        echo "  seed                    Run seeders from src/seeds/\n";
+        echo "  routes                  List all registered routes\n";
+        echo "  metrics [--top N] [--json] [--fail-on warn|error] [--path DIR]  Rank top code-quality offenders\n";
+        echo "  test                    Run test suite\n";
+        echo "  build                   Build distributable package\n";
+        echo "  generate <what> <name>  Generate scaffolding\n";
+        echo "  ai [--all]              Detect AI tools and install context\n";
+        echo "  console                 Interactive PHP REPL with Tina4 loaded\n";
+        echo "  help                    Show this help\n";
+        echo "\nGenerators:\n";
+        echo "  generate model <Name> [--fields \"name:string,price:float\"]\n";
+        echo "  generate route <name> [--model Name]\n";
+        echo "  generate crud <Name> [--fields \"...\"]   Model + migration + routes + form + view + test\n";
+        echo "  generate migration <description>\n";
+        echo "  generate middleware <Name>\n";
+        echo "  generate test <name>\n";
+        echo "  generate form <Name> [--fields \"...\"]   Form template with typed inputs\n";
+        echo "  generate view <Name> [--fields \"...\"]   List + detail templates\n";
+        echo "  generate auth                           Login/register routes + User model + templates\n";
+        echo "\nField types: string, int, float, bool, text, datetime, blob\n";
+        echo "Table names: singular by default (Product -> product)\n";
+        echo "\nhttps://tina4.com\n";
+        break;
+}
+
+
+// ════════════════════════════════════════════════════════════════════════
+// Generator functions
+// ════════════════════════════════════════════════════════════════════════
+
+/**
+ * Generate ORM model + matching migration.
+ *
+ * tina4php generate model Product
+ * tina4php generate model Product --fields "name:string,price:float,in_stock:bool"
+ */
+function generateModel(string $name, array $flags, array $fieldTypeMap, bool $skipMigration = false): void
+{
+    $fields = parseFields($flags['fields'] ?? '');
+    $table = tableNameFromClass($name);
+
+    // Build typed property lines
+    $propLines = ["    public ?int \$id = null;"];
+    if (!empty($fields)) {
+        foreach ($fields as [$fname, $ftype]) {
+            $info = $fieldTypeMap[$ftype] ?? $fieldTypeMap['string'];
+            $nullable = $info['nullable'] ? '?' : '';
+            $propLines[] = "    public {$nullable}{$info['php']} \${$fname} = {$info['default']};";
+        }
+    } else {
+        $propLines[] = "    public string \$name = '';";
+    }
+    $propLines[] = "    public ?string \$createdAt = null;";
+
+    // Write model file
+    $dir = 'src/orm';
+    @mkdir($dir, 0755, true);
+    $path = "{$dir}/{$name}.php";
+    if (file_exists($path)) {
+        echo "  File already exists: {$path}\n";
+        return;
+    }
+
+    $propsStr = implode("\n", $propLines);
+    $content = <<<PHP
+<?php
+
+class {$name} extends \\Tina4\\ORM
+{
+    public string \$tableName = '{$table}';
+    public string \$primaryKey = 'id';
+
+{$propsStr}
+}
+
+PHP;
+
+    file_put_contents($path, $content);
+    echo "  Created {$path}\n";
+
+    // Generate matching migration (unless --no-migration or caller skipped)
+    if (!$skipMigration && !isset($flags['no-migration'])) {
+        generateMigration("create_{$table}", $flags, $fieldTypeMap, $fields, $table);
+    }
+}
+
+
+/**
+ * Generate CRUD route file with Swagger docblocks.
+ *
+ * tina4php generate route products
+ * tina4php generate route products --model Product
+ */
+function generateRoute(string $name, array $flags): void
+{
+    $routePath = ltrim($name, '/');
+    $singular = rtrim($routePath, 's');
+    if ($singular === $routePath) {
+        $singular = $routePath;
+    }
+    $model = $flags['model'] ?? '';
+    $ucSingular = ucfirst($singular);
+
+    $dir = 'src/routes';
+    @mkdir($dir, 0755, true);
+    $path = "{$dir}/{$routePath}.php";
+    if (file_exists($path)) {
+        echo "  File already exists: {$path}\n";
+        return;
+    }
+
+    if ($model) {
+        $content = <<<PHP
+<?php
+
+/**
+ * @description List all {$routePath}
+ * @tags {$routePath}
+ */
+Router::get("/{$routePath}", function (\\Tina4\\Request \$request, \\Tina4\\Response \$response) {
+    try {
+        \$page = (int)(\$request->params['page'] ?? 1);
+        \$perPage = (int)(\$request->params['per_page'] ?? 20);
+        \$offset = (\$page - 1) * \$perPage;
+        \$items = (new {$model}())->select("*", "", [], "", "", "", "", \$perPage, \$offset);
+        return \$response(\$items, 200);
+    } catch (\\Throwable \$e) {
+        \\Tina4\\Debug::message(\$e->getMessage(), TINA4_LOG_ERROR);
+        return \$response(["error" => "Failed to list {$routePath}"], 500);
+    }
+});
+
+/**
+ * @description Get a {$singular} by ID
+ * @tags {$routePath}
+ */
+Router::get("/{$routePath}/{id}", function (\\Tina4\\Request \$request, \\Tina4\\Response \$response) {
+    try {
+        \$item = (new {$model}());
+        if (!\$item->load("id = ?", [\$request->params['id']])) {
+            return \$response(["error" => "Not found"], 404);
+        }
+        return \$response(\$item, 200);
+    } catch (\\Throwable \$e) {
+        \\Tina4\\Debug::message(\$e->getMessage(), TINA4_LOG_ERROR);
+        return \$response(["error" => "Failed to get {$singular}"], 500);
+    }
+});
+
+/**
+ * @description Create a new {$singular}
+ * @tags {$routePath}
+ */
+Router::post("/{$routePath}", function (\\Tina4\\Request \$request, \\Tina4\\Response \$response) {
+    try {
+        \$item = new {$model}(\$request);
+        \$item->save();
+        return \$response(\$item, 201);
+    } catch (\\Throwable \$e) {
+        \\Tina4\\Debug::message(\$e->getMessage(), TINA4_LOG_ERROR);
+        return \$response(["error" => "Failed to create {$singular}"], 500);
+    }
+});
+
+/**
+ * @description Update a {$singular}
+ * @tags {$routePath}
+ */
+Router::put("/{$routePath}/{id}", function (\\Tina4\\Request \$request, \\Tina4\\Response \$response) {
+    try {
+        \$item = new {$model}(\$request);
+        \$item->id = (int)\$request->params['id'];
+        \$item->save();
+        return \$response(\$item, 200);
+    } catch (\\Throwable \$e) {
+        \\Tina4\\Debug::message(\$e->getMessage(), TINA4_LOG_ERROR);
+        return \$response(["error" => "Failed to update {$singular}"], 500);
+    }
+});
+
+/**
+ * @description Delete a {$singular}
+ * @tags {$routePath}
+ */
+Router::delete("/{$routePath}/{id}", function (\\Tina4\\Request \$request, \\Tina4\\Response \$response) {
+    try {
+        \$item = new {$model}();
+        if (!\$item->load("id = ?", [\$request->params['id']])) {
+            return \$response(["error" => "Not found"], 404);
+        }
+        \$item->delete();
+        return \$response(null, 204);
+    } catch (\\Throwable \$e) {
+        \\Tina4\\Debug::message(\$e->getMessage(), TINA4_LOG_ERROR);
+        return \$response(["error" => "Failed to delete {$singular}"], 500);
+    }
+});
+
+PHP;
+    } else {
+        $content = <<<PHP
+<?php
+
+/**
+ * @description List all {$routePath}
+ * @tags {$routePath}
+ */
+Router::get("/{$routePath}", function (\\Tina4\\Request \$request, \\Tina4\\Response \$response) {
+    return \$response(["data" => []], 200);
+});
+
+/**
+ * @description Get a {$singular} by ID
+ * @tags {$routePath}
+ */
+Router::get("/{$routePath}/{id}", function (\\Tina4\\Request \$request, \\Tina4\\Response \$response) {
+    return \$response(["data" => []], 200);
+});
+
+/**
+ * @description Create a new {$singular}
+ * @tags {$routePath}
+ */
+Router::post("/{$routePath}", function (\\Tina4\\Request \$request, \\Tina4\\Response \$response) {
+    return \$response(["message" => "created"], 201);
+});
+
+/**
+ * @description Update a {$singular}
+ * @tags {$routePath}
+ */
+Router::put("/{$routePath}/{id}", function (\\Tina4\\Request \$request, \\Tina4\\Response \$response) {
+    return \$response(["message" => "updated"], 200);
+});
+
+/**
+ * @description Delete a {$singular}
+ * @tags {$routePath}
+ */
+Router::delete("/{$routePath}/{id}", function (\\Tina4\\Request \$request, \\Tina4\\Response \$response) {
+    return \$response(null, 204);
+});
+
+PHP;
+    }
+
+    file_put_contents($path, $content);
+    echo "  Created {$path}\n";
+}
+
+
+/**
+ * Generate full CRUD stack: model + migration + routes + form + view + test.
+ *
+ * tina4php generate crud Product --fields "name:string,price:float"
+ */
+function generateCrud(string $name, array $flags, array $fieldTypeMap): void
+{
+    $table = tableNameFromClass($name);
+    $routeName = $table . 's';
+
+    echo "\n  Generating CRUD for {$name}...\n\n";
+
+    // 1. Model + migration
+    generateModel($name, $flags, $fieldTypeMap);
+
+    // 2. Routes with model
+    generateRoute($routeName, ['model' => $name]);
+
+    // 3. Form
+    generateForm($name, $flags);
+
+    // 4. View (list + detail)
+    generateView($name, $flags);
+
+    // 5. Test
+    generateTest($routeName, ['model' => $name]);
+
+    echo "\n  CRUD generation complete for {$name}.\n";
+    echo "  Run: tina4php migrate\n";
+    echo "  Visit: /swagger to see the API docs\n";
+}
+
+
+/**
+ * Generate a timestamped migration file with UP/DOWN sections + .down.sql.
+ *
+ * tina4php generate migration create_product
+ * tina4php generate migration add_category_to_product
+ */
+function generateMigration(
+    string $name,
+    array $flags,
+    array $fieldTypeMap,
+    ?array $fieldsOverride = null,
+    ?string $tableOverride = null
+): void {
+    $now = new DateTime();
+    $timestamp = $now->format('YmdHis');
+    $dir = 'migrations';
+    @mkdir($dir, 0755, true);
+
+    // Determine table name
+    if ($tableOverride) {
+        $table = $tableOverride;
+    } else {
+        $stripped = $name;
+        foreach (['create_', 'add_', 'drop_'] as $prefix) {
+            if (str_starts_with($stripped, $prefix)) {
+                $stripped = substr($stripped, strlen($prefix));
+                break;
+            }
+        }
+        $table = tableNameFromClass($stripped);
+    }
+
+    // Build SQL columns from fields
+    $fields = $fieldsOverride ?? parseFields($flags['fields'] ?? '');
+    $isCreate = str_starts_with($name, 'create_') || $fieldsOverride !== null;
+
+    $filename = "{$timestamp}_{$name}.sql";
+    $path = "{$dir}/{$filename}";
+
+    if ($isCreate) {
+        $colLines = ["    id INTEGER PRIMARY KEY AUTOINCREMENT"];
+        foreach ($fields as [$fname, $ftype]) {
+            $info = $fieldTypeMap[$ftype] ?? $fieldTypeMap['string'];
+            $sqlDefault = '';
+            if ($info['default'] !== 'null' && $info['default'] !== 'NULL') {
+                $sqlDefault = " DEFAULT {$info['default']}";
+            }
+            $colLines[] = "    {$fname} {$info['sql']}{$sqlDefault}";
+        }
+        $colLines[] = "    created_at DATETIME DEFAULT CURRENT_TIMESTAMP";
+
+        $upSql = "CREATE TABLE IF NOT EXISTS {$table} (\n" . implode(",\n", $colLines) . "\n);";
+        $downSql = "DROP TABLE IF EXISTS {$table};";
+    } else {
+        $upSql = "-- Write your UP migration SQL here\n-- Example: ALTER TABLE {$table} ADD COLUMN new_col VARCHAR(255) DEFAULT '';";
+        $downSql = "-- Write your DOWN rollback SQL here\n-- Example: ALTER TABLE {$table} DROP COLUMN new_col;";
+    }
+
+    $dateStr = $now->format('Y-m-d H:i:s');
+    $content = <<<SQL
+-- Migration: {$name}
+-- Created: {$dateStr}
+
+-- UP
+{$upSql}
+
+-- DOWN
+{$downSql}
+
+SQL;
+
+    file_put_contents($path, $content);
+    echo "  Created {$path}\n";
+
+    // Also create .down.sql for the migration runner
+    $downPath = "{$dir}/{$timestamp}_{$name}.down.sql";
+    $downContent = <<<SQL
+-- Rollback: {$name}
+-- Created: {$dateStr}
+
+{$downSql}
+
+SQL;
+
+    file_put_contents($downPath, $downContent);
+    echo "  Created {$downPath}\n";
+}
+
+
+/**
+ * Generate middleware with before/after static methods.
+ *
+ * tina4php generate middleware AuthLog
+ */
+function generateMiddleware(string $name, array $flags): void
+{
+    $snake = tableNameFromClass($name);
+    $dir = 'src/middleware';
+    @mkdir($dir, 0755, true);
+    $path = "{$dir}/{$name}.php";
+    if (file_exists($path)) {
+        echo "  File already exists: {$path}\n";
+        return;
+    }
+
+    $content = <<<PHP
+<?php
+
+/**
+ * {$name} middleware.
+ *
+ * Usage in routes:
+ *   Router::get("/api/protected", function (Request \$request, Response \$response) {
+ *       return \$response(["data" => "protected"], 200);
+ *   })->middleware(['{$name}::before{$name}']);
+ */
+class {$name}
+{
+    /**
+     * Runs before the route handler.
+     *
+     * Return null to continue, or a Response to block.
+     */
+    public static function before{$name}(\\Tina4\\Request \$request, \\Tina4\\Response \$response): ?array
+    {
+        \$auth = \$request->getHeader("Authorization");
+        if (empty(\$auth)) {
+            return [\$request, \$response(["error" => "Unauthorized"], 401)];
+        }
+        return [\$request, \$response];
+    }
+
+    /**
+     * Runs after the route handler.
+     */
+    public static function after{$name}(\\Tina4\\Request \$request, \\Tina4\\Response \$response): ?array
+    {
+        return [\$request, \$response];
+    }
+}
+
+PHP;
+
+    file_put_contents($path, $content);
+    echo "  Created {$path}\n";
+}
+
+
+/**
+ * Generate a PHPUnit test file.
+ *
+ * tina4php generate test products
+ * tina4php generate test products --model Product
+ */
+function generateTest(string $name, array $flags = []): void
+{
+    $model = $flags['model'] ?? '';
+    $snake = tableNameFromClass($name);
+    $singular = rtrim($snake, 's');
+    if ($singular === $snake) {
+        $singular = $snake;
+    }
+    $className = str_replace(' ', '', ucwords(str_replace('_', ' ', $snake)));
+
+    $dir = 'tests';
+    @mkdir($dir, 0755, true);
+    $path = "{$dir}/{$className}Test.php";
+    if (file_exists($path)) {
+        echo "  File already exists: {$path}\n";
+        return;
+    }
+
+    if ($model) {
+        $content = <<<PHP
+<?php
+
+use PHPUnit\\Framework\\TestCase;
+
+/**
+ * Tests for {$name} CRUD operations.
+ */
+class {$className}Test extends TestCase
+{
+    protected function setUp(): void
+    {
+        // Set up test fixtures
+    }
+
+    protected function tearDown(): void
+    {
+        // Clean up after tests
+    }
+
+    public function testList{$className}(): void
+    {
+        // TODO: implement
+        \$this->assertTrue(true);
+    }
+
+    public function testGet{$className}(): void
+    {
+        // TODO: implement
+        \$this->assertTrue(true);
+    }
+
+    public function testCreate{$className}(): void
+    {
+        // TODO: implement
+        \$this->assertTrue(true);
+    }
+
+    public function testUpdate{$className}(): void
+    {
+        // TODO: implement
+        \$this->assertTrue(true);
+    }
+
+    public function testDelete{$className}(): void
+    {
+        // TODO: implement
+        \$this->assertTrue(true);
+    }
+}
+
+PHP;
+    } else {
+        $content = <<<PHP
+<?php
+
+use PHPUnit\\Framework\\TestCase;
+
+/**
+ * Tests for {$name}.
+ */
+class {$className}Test extends TestCase
+{
+    protected function setUp(): void
+    {
+        // Set up test fixtures
+    }
+
+    protected function tearDown(): void
+    {
+        // Clean up after tests
+    }
+
+    public function testExample(): void
+    {
+        // TODO: replace with real tests
+        \$this->assertTrue(true);
+    }
+}
+
+PHP;
+    }
+
+    file_put_contents($path, $content);
+    echo "  Created {$path}\n";
+}
+
+
+/**
+ * Generate a Twig form template with typed inputs and form_token.
+ *
+ * tina4php generate form Product
+ * tina4php generate form Product --fields "name:string,price:float"
+ */
+function generateForm(string $name, array $flags): void
+{
+    global $INPUT_TYPE_MAP;
+    $fields = parseFields($flags['fields'] ?? '');
+    $table = tableNameFromClass($name);
+    $routeName = $table . 's';
+
+    $dir = 'src/templates/forms';
+    @mkdir($dir, 0755, true);
+    $path = "{$dir}/{$table}.twig";
+    if (file_exists($path)) {
+        echo "  File already exists: {$path}\n";
+        return;
+    }
+
+    // Build form fields
+    $fieldHtml = '';
+    $fieldList = !empty($fields) ? $fields : [['name', 'string']];
+    foreach ($fieldList as [$fname, $ftype]) {
+        $itype = $INPUT_TYPE_MAP[$ftype] ?? 'text';
+        $label = ucwords(str_replace('_', ' ', $fname));
+        $step = in_array($ftype, ['float', 'numeric', 'decimal']) ? ' step="0.01"' : '';
+
+        if ($itype === 'textarea') {
+            $fieldHtml .= <<<TWIG
+    <div class="form-group mb-3">
+        <label for="{$fname}">{$label}</label>
+        <textarea id="{$fname}" name="{$fname}" class="form-control" rows="4" placeholder="{$label}">{{ item.{$fname} }}</textarea>
+    </div>
+
+TWIG;
+        } elseif ($itype === 'checkbox') {
+            $fieldHtml .= <<<TWIG
+    <div class="form-group mb-3">
+        <label>
+            <input type="checkbox" id="{$fname}" name="{$fname}" value="1" {% if item.{$fname} %}checked{% endif %}>
+            {$label}
+        </label>
+    </div>
+
+TWIG;
+        } else {
+            $fieldHtml .= <<<TWIG
+    <div class="form-group mb-3">
+        <label for="{$fname}">{$label}</label>
+        <input type="{$itype}" id="{$fname}" name="{$fname}" class="form-control"{$step} value="{{ item.{$fname} }}" placeholder="{$label}">
+    </div>
+
+TWIG;
+        }
+    }
+
+    $content = <<<TWIG
+{% extends "base.twig" %}
+{% block title %}{$name} {% if item.id %}Edit{% else %}Create{% endif %}{% endblock %}
+{% block content %}
+<div class="container mt-4">
+    <h1>{% if item.id %}Edit {$name}{% else %}Create {$name}{% endif %}</h1>
+    <form method="post" action="/api/{$routeName}{% if item.id %}/{{ item.id }}{% endif %}">
+        {{ form_token() }}
+{$fieldHtml}    <button type="submit" class="btn btn-primary">
+        {% if item.id %}Update{% else %}Create{% endif %}
+    </button>
+    <a href="/api/{$routeName}" class="btn btn-secondary">Cancel</a>
+    </form>
+</div>
+{% endblock %}
+
+TWIG;
+
+    file_put_contents($path, $content);
+    echo "  Created {$path}\n";
+}
+
+
+/**
+ * Generate list + detail view templates.
+ *
+ * tina4php generate view Product
+ * tina4php generate view Product --fields "name:string,price:float"
+ */
+function generateView(string $name, array $flags): void
+{
+    $fields = parseFields($flags['fields'] ?? '');
+    $table = tableNameFromClass($name);
+    $routeName = $table . 's';
+
+    $dir = 'src/templates/pages';
+    @mkdir($dir, 0755, true);
+
+    $cols = !empty($fields) ? array_map(fn($f) => $f[0], $fields) : ['name'];
+
+    // List view
+    $listPath = "{$dir}/{$routeName}.twig";
+    if (!file_exists($listPath)) {
+        $th = implode("\n                ", array_map(fn($c) => '<th>' . ucwords(str_replace('_', ' ', $c)) . '</th>', $cols));
+        $td = implode("\n                ", array_map(fn($c) => '<td>{{ item.' . $c . ' }}</td>', $cols));
+
+        $listContent = <<<TWIG
+{% extends "base.twig" %}
+{% block title %}{$name}s{% endblock %}
+{% block content %}
+<div class="container mt-4">
+    <div class="d-flex justify-content-between align-items-center mb-3">
+        <h1>{$name}s</h1>
+        <a href="/{$routeName}/create" class="btn btn-primary">Add {$name}</a>
+    </div>
+    <table class="table">
+        <thead>
+            <tr>
+                <th>ID</th>
+                {$th}
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for item in items %}
+            <tr>
+                <td>{{ item.id }}</td>
+                {$td}
+                <td>
+                    <a href="/{$routeName}/{{ item.id }}" class="btn btn-sm btn-primary">View</a>
+                    <a href="/{$routeName}/{{ item.id }}/edit" class="btn btn-sm btn-secondary">Edit</a>
+                </td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}
+
+TWIG;
+        file_put_contents($listPath, $listContent);
+        echo "  Created {$listPath}\n";
+    }
+
+    // Detail view
+    $detailPath = "{$dir}/{$table}.twig";
+    if (!file_exists($detailPath)) {
+        $detailFields = implode("\n", array_map(fn($c) =>
+            '    <div class="mb-3"><strong>' . ucwords(str_replace('_', ' ', $c)) . ':</strong> {{ item.' . $c . ' }}</div>',
+            $cols
+        ));
+
+        $detailContent = <<<TWIG
+{% extends "base.twig" %}
+{% block title %}{$name} Detail{% endblock %}
+{% block content %}
+<div class="container mt-4">
+    <div class="d-flex justify-content-between align-items-center mb-3">
+        <h1>{$name} #{{ item.id }}</h1>
+        <div>
+            <a href="/{$routeName}/{{ item.id }}/edit" class="btn btn-secondary">Edit</a>
+            <a href="/{$routeName}" class="btn btn-outline-secondary">Back</a>
+        </div>
+    </div>
+{$detailFields}
+</div>
+{% endblock %}
+
+TWIG;
+        file_put_contents($detailPath, $detailContent);
+        echo "  Created {$detailPath}\n";
+    }
+}
+
+
+/**
+ * Generate authentication scaffolding: User model, auth routes, login/register templates, test.
+ *
+ * tina4php generate auth
+ */
+function generateAuth(string $name, array $flags, array $fieldTypeMap): void
+{
+    echo "\n  Generating authentication scaffolding...\n\n";
+
+    // 1. User model + migration
+    generateModel('User', ['fields' => 'email:string,password:string,role:string'], $fieldTypeMap);
+
+    // 2. Auth routes
+    $dir = 'src/routes';
+    @mkdir($dir, 0755, true);
+    $authPath = "{$dir}/auth.php";
+    if (!file_exists($authPath)) {
+        $content = <<<'PHP'
+<?php
+
+/**
+ * @description Register a new user
+ * @tags auth
+ */
+Router::post("/api/auth/register", function (\Tina4\Request $request, \Tina4\Response $response) {
+    try {
+        $body = (array)$request->body;
+        $email = $body['email'] ?? '';
+        $password = $body['password'] ?? '';
+
+        if (empty($email) || empty($password)) {
+            return $response(["error" => "Email and password required"], 400);
+        }
+
+        // Check if user exists
+        $existing = new User();
+        if ($existing->load("email = ?", [$email])) {
+            return $response(["error" => "Email already registered"], 409);
+        }
+
+        // Create user with hashed password
+        $user = new User();
+        $user->email = $email;
+        $user->password = \Tina4\Auth::hashPassword($password);
+        $user->role = 'user';
+        $user->save();
+
+        return $response(["message" => "Registered", "id" => $user->id], 201);
+    } catch (\Throwable $e) {
+        \Tina4\Debug::message($e->getMessage(), TINA4_LOG_ERROR);
+        return $response(["error" => "Registration failed"], 500);
+    }
+})->noCache();
+
+/**
+ * @description Login and receive JWT token
+ * @tags auth
+ */
+Router::post("/api/auth/login", function (\Tina4\Request $request, \Tina4\Response $response) {
+    try {
+        $body = (array)$request->body;
+        $email = $body['email'] ?? '';
+        $password = $body['password'] ?? '';
+
+        $user = new User();
+        if (!$user->load("email = ?", [$email])) {
+            return $response(["error" => "Invalid credentials"], 401);
+        }
+
+        if (!\Tina4\Auth::checkPassword($password, $user->password)) {
+            return $response(["error" => "Invalid credentials"], 401);
+        }
+
+        $secret = getenv('SECRET') ?: 'change-me-in-production';
+        $token = \Tina4\Auth::getToken(
+            ["user_id" => $user->id, "email" => $user->email, "role" => $user->role],
+            $secret
+        );
+        return $response(["token" => $token], 200);
+    } catch (\Throwable $e) {
+        \Tina4\Debug::message($e->getMessage(), TINA4_LOG_ERROR);
+        return $response(["error" => "Login failed"], 500);
+    }
+})->noCache();
+
+/**
+ * @description Get current user profile
+ * @tags auth
+ */
+Router::get("/api/auth/me", function (\Tina4\Request $request, \Tina4\Response $response) {
+    try {
+        $authHeader = $request->getHeader("Authorization");
+        if (empty($authHeader)) {
+            return $response(["error" => "Unauthorized"], 401);
+        }
+
+        $token = str_replace("Bearer ", "", $authHeader);
+        $secret = getenv('SECRET') ?: 'change-me-in-production';
+        $payload = \Tina4\Auth::validToken($token, $secret);
+
+        if ($payload === null) {
+            return $response(["error" => "Invalid token"], 401);
+        }
+
+        $user = new User();
+        if (!$user->load("id = ?", [$payload['user_id'] ?? 0])) {
+            return $response(["error" => "User not found"], 404);
+        }
+
+        return $response(["id" => $user->id, "email" => $user->email, "role" => $user->role], 200);
+    } catch (\Throwable $e) {
+        \Tina4\Debug::message($e->getMessage(), TINA4_LOG_ERROR);
+        return $response(["error" => "Failed to get profile"], 500);
+    }
+})->secure();
+PHP;
+
+        file_put_contents($authPath, $content);
+        echo "  Created {$authPath}\n";
+    }
+
+    // 3. Login template
+    $formsDir = 'src/templates/forms';
+    @mkdir($formsDir, 0755, true);
+    $loginPath = "{$formsDir}/login.twig";
+    if (!file_exists($loginPath)) {
+        $loginContent = <<<'TWIG'
+{% extends "base.twig" %}
+{% block title %}Login{% endblock %}
+{% block content %}
+<div class="container mt-4" style="max-width:400px">
+    <h1>Login</h1>
+    <form method="post" action="/api/auth/login">
+        {{ form_token() }}
+        <div class="form-group mb-3">
+            <label for="email">Email</label>
+            <input type="email" id="email" name="email" class="form-control" placeholder="you@example.com" required>
+        </div>
+        <div class="form-group mb-3">
+            <label for="password">Password</label>
+            <input type="password" id="password" name="password" class="form-control" placeholder="Password" required>
+        </div>
+        <button type="submit" class="btn btn-primary w-100">Login</button>
+        <p class="mt-3 text-center"><a href="/register">Create an account</a></p>
+    </form>
+</div>
+{% endblock %}
+TWIG;
+        file_put_contents($loginPath, $loginContent);
+        echo "  Created {$loginPath}\n";
+    }
+
+    // 4. Register template
+    $registerPath = "{$formsDir}/register.twig";
+    if (!file_exists($registerPath)) {
+        $registerContent = <<<'TWIG'
+{% extends "base.twig" %}
+{% block title %}Register{% endblock %}
+{% block content %}
+<div class="container mt-4" style="max-width:400px">
+    <h1>Register</h1>
+    <form method="post" action="/api/auth/register">
+        {{ form_token() }}
+        <div class="form-group mb-3">
+            <label for="email">Email</label>
+            <input type="email" id="email" name="email" class="form-control" placeholder="you@example.com" required>
+        </div>
+        <div class="form-group mb-3">
+            <label for="password">Password</label>
+            <input type="password" id="password" name="password" class="form-control" placeholder="Password" minlength="8" required>
+        </div>
+        <button type="submit" class="btn btn-primary w-100">Register</button>
+        <p class="mt-3 text-center"><a href="/login">Already have an account?</a></p>
+    </form>
+</div>
+{% endblock %}
+TWIG;
+        file_put_contents($registerPath, $registerContent);
+        echo "  Created {$registerPath}\n";
+    }
+
+    // 5. Auth test
+    generateTest('auth', ['model' => 'User']);
+
+    echo "\n  Authentication scaffolding complete.\n";
+    echo "  Run: tina4php migrate\n";
+    echo "  POST /api/auth/register  -- create account\n";
+    echo "  POST /api/auth/login     -- get JWT token\n";
+    echo "  GET  /api/auth/me        -- get profile (requires token)\n";
+}

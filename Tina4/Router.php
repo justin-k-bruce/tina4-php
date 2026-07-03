@@ -1,0 +1,1713 @@
+<?php
+
+/**
+ * Tina4 — The Intelligent Native Application 4ramework
+ * Copyright 2007 - current Tina4
+ * License: MIT https://opensource.org/licenses/MIT
+ */
+
+namespace Tina4;
+
+/**
+ * Zero-dependency HTTP router with dynamic params, middleware, groups, and caching.
+ *
+ * Usage:
+ *   Router::get('/users/{id}', fn($req, $res) => $res->json(['id' => $req->params['id']]));
+ *   Router::group('/api/v1', function() {
+ *       Router::get('/users', $handler);
+ *   });
+ */
+class Router
+{
+    /**
+     * @var array<string, array<int, array{
+     *     pattern: string,
+     *     regex: string,
+     *     paramNames: array<string>,
+     *     callback: callable,
+     *     middleware: array<callable>,
+     *     cache: bool,
+     *     secure: bool,
+     *     noAuth: bool,
+     *     catchAll: bool,
+     *     catchAllName: string|null,
+     * }>> Routes indexed by HTTP method
+     */
+    private static array $routes = [];
+
+    /** @var array<int, array{path: string, handler: callable, secure: bool, auth_required: bool}> Registered WebSocket routes */
+    private static array $wsRoutes = [];
+
+    /** @var string Current group prefix */
+    private static string $groupPrefix = '';
+
+    /** @var array<callable> Current group middleware */
+    private static array $groupMiddleware = [];
+
+    /** @var string Base path for static file serving */
+    public static string $basePath = '.';
+
+    /** @var int Index of the last registered route (for chaining) */
+    private static ?int $lastRouteIndex = null;
+
+    /** @var string Method of the last registered route */
+    private static ?string $lastRouteMethod = null;
+
+    /**
+     * Memoised continuations for string middleware specs ("ResponseCache:300")
+     * so one ResponseCache instance (and its backend) is reused across requests
+     * — parity with Python resolving the spec once at registration.
+     *
+     * @var array<string, \Closure>
+     */
+    private static array $resolvedStringMiddleware = [];
+
+    /** @var array<string, string>|null Cached template lookup: url_path => template_file */
+    private static ?array $templateCache = null;
+
+    /**
+     * Auto-routing scans this single subdirectory of src/templates/. Only files
+     * in src/templates/pages/ become URLs — everything else (partials, layouts,
+     * base.twig, errors, components, macros) is never URL-exposed and remains
+     * renderable only via {% include %} / {% extends %} / $response->render().
+     *
+     * Convention adapted from Next.js' pages/ directory and Nuxt's pages/ folder.
+     * Explicit, secure by default, no skip lists to maintain.
+     */
+    private const TEMPLATE_PAGES_DIR = 'pages';
+
+    /**
+     * Register a global middleware class.
+     *
+     * Delegates to Middleware::use(). The middleware class should follow the
+     * standardized convention with static `before*` and `after*` methods.
+     *
+     * Usage:
+     *   Router::use(\Tina4\Middleware\CorsMiddleware::class);
+     *   Router::use(\Tina4\Middleware\RateLimiter::class);
+     *
+     * @param string $class Fully-qualified middleware class name
+     */
+    public static function use(string $class): void
+    {
+        Middleware::use($class);
+    }
+
+    /**
+     * Register a route for a specific HTTP method.
+     * Core registration method — all convenience methods delegate here.
+     *
+     * @param string   $method   HTTP method (GET, POST, PUT, PATCH, DELETE, ANY)
+     * @param string   $path     URL pattern
+     * @param callable $handler  Route handler callable
+     */
+    public static function add(string $method, string $path, callable $handler, array $middleware = [], array $swaggerMeta = [], ?string $template = null): self
+    {
+        $method = strtoupper($method);
+        if ($method === 'ANY') {
+            return self::any($path, $handler, $middleware, $swaggerMeta, $template);
+        }
+        return self::addRoute($method, $path, $handler, $swaggerMeta, $middleware, $template);
+    }
+
+    /**
+     * Register a GET route.
+     */
+    public static function get(string $path, callable $handler, array $middleware = [], array $swaggerMeta = [], ?string $template = null): self
+    {
+        return self::addRoute('GET', $path, $handler, $swaggerMeta, $middleware, $template);
+    }
+
+    /**
+     * Register a POST route.
+     */
+    public static function post(string $path, callable $handler, array $middleware = [], array $swaggerMeta = [], ?string $template = null): self
+    {
+        return self::addRoute('POST', $path, $handler, $swaggerMeta, $middleware, $template);
+    }
+
+    /**
+     * Register a PUT route.
+     */
+    public static function put(string $path, callable $handler, array $middleware = [], array $swaggerMeta = [], ?string $template = null): self
+    {
+        return self::addRoute('PUT', $path, $handler, $swaggerMeta, $middleware, $template);
+    }
+
+    /**
+     * Register a PATCH route.
+     */
+    public static function patch(string $path, callable $handler, array $middleware = [], array $swaggerMeta = [], ?string $template = null): self
+    {
+        return self::addRoute('PATCH', $path, $handler, $swaggerMeta, $middleware, $template);
+    }
+
+    /**
+     * Register a DELETE route.
+     */
+    public static function delete(string $path, callable $handler, array $middleware = [], array $swaggerMeta = [], ?string $template = null): self
+    {
+        return self::addRoute('DELETE', $path, $handler, $swaggerMeta, $middleware, $template);
+    }
+
+    /**
+     * Register an explicit HEAD route.
+     *
+     * By default the framework auto-handles HEAD by falling back to the GET
+     * route and stripping the body (RFC 9110 §9.3.2). Use this method only
+     * when you need a HEAD handler that does something different from GET —
+     * e.g. cheaper existence-check logic, custom validator headers without
+     * the cost of building the body.
+     *
+     * The framework still strips the response body for you on the way out —
+     * HEAD MUST NOT return content, even if your handler does, so we
+     * enforce that unconditionally rather than relying on developer care.
+     */
+    public static function head(string $path, callable $handler, array $middleware = [], array $swaggerMeta = [], ?string $template = null): self
+    {
+        return self::addRoute('HEAD', $path, $handler, $swaggerMeta, $middleware, $template);
+    }
+
+    /**
+     * Register an explicit OPTIONS route.
+     *
+     * By default the framework auto-handles OPTIONS by building an Allow
+     * header from every method registered for the path and returning 204
+     * (RFC 9110 §9.3.7). Use this method to take over that behaviour —
+     * e.g. to return a richer OPTIONS payload describing the resource.
+     */
+    public static function options(string $path, callable $handler, array $middleware = [], array $swaggerMeta = [], ?string $template = null): self
+    {
+        return self::addRoute('OPTIONS', $path, $handler, $swaggerMeta, $middleware, $template);
+    }
+
+    /**
+     * Register a route for any HTTP method.
+     */
+    public static function any(string $path, callable $handler, array $middleware = [], array $swaggerMeta = [], ?string $template = null): self
+    {
+        foreach (['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] as $method) {
+            self::addRoute($method, $path, $handler, $swaggerMeta, $middleware, $template);
+        }
+        // Point lastRoute to the GET one for chaining
+        self::$lastRouteMethod = 'GET';
+        self::$lastRouteIndex = count(self::$routes['GET']) - 1;
+        return new self();
+    }
+
+    /**
+     * Define a route group with a shared prefix and optional middleware.
+     *
+     * @param string $prefix URL prefix for all routes in the group
+     * @param callable $callback Closure that registers routes within the group
+     * @param array<callable> $middleware Middleware to apply to all routes in the group
+     */
+    public static function group(string $prefix, callable $callback, array $middleware = []): void
+    {
+        $previousPrefix = self::$groupPrefix;
+        $previousMiddleware = self::$groupMiddleware;
+
+        self::$groupPrefix = $previousPrefix . rtrim($prefix, '/');
+        self::$groupMiddleware = array_merge($previousMiddleware, $middleware);
+
+        $callback();
+
+        self::$groupPrefix = $previousPrefix;
+        self::$groupMiddleware = $previousMiddleware;
+    }
+
+    /**
+     * Add middleware to the last registered route.
+     *
+     * @param array<callable> $middleware
+     * @return $this
+     */
+    public function middleware(array $middleware): self
+    {
+        if (self::$lastRouteMethod !== null && self::$lastRouteIndex !== null) {
+            $route = &self::$routes[self::$lastRouteMethod][self::$lastRouteIndex];
+            $route['middleware'] = array_merge($route['middleware'], $middleware);
+
+            // Middleware is purely additive — it never opens up auth as a
+            // side effect. Developers explicitly open write routes with
+            // ->noAuth() (or Router::any()) and lock GET routes with
+            // ->secure(). Pre-3.13.2 this branch silently set
+            // noAuth=true whenever middleware was attached, which let
+            // POST/PUT/PATCH/DELETE routes serve unauthenticated traffic
+            // the moment a logging or CORS middleware landed on them —
+            // a security footgun. tina4-book#141 PY-10-02 parity fix.
+
+            // If this was registered via any(), apply to all methods
+            if ($this->wasAnyRoute()) {
+                foreach (['POST', 'PUT', 'PATCH', 'DELETE'] as $method) {
+                    $idx = $this->findMatchingRoute($method, $route['pattern']);
+                    if ($idx !== null) {
+                        self::$routes[$method][$idx]['middleware'] = $route['middleware'];
+                    }
+                }
+            }
+        }
+        return $this;
+    }
+
+    /**
+     * Mark the last registered route as cacheable.
+     *
+     * @return $this
+     */
+    public function cache(): self
+    {
+        if (self::$lastRouteMethod !== null && self::$lastRouteIndex !== null) {
+            self::$routes[self::$lastRouteMethod][self::$lastRouteIndex]['cache'] = true;
+        }
+        return $this;
+    }
+
+    /**
+     * Mark the last registered route as non-cacheable.
+     *
+     * @return $this
+     */
+    public function noCache(): self
+    {
+        if (self::$lastRouteMethod !== null && self::$lastRouteIndex !== null) {
+            self::$routes[self::$lastRouteMethod][self::$lastRouteIndex]['cache'] = false;
+        }
+        return $this;
+    }
+
+    /**
+     * Attach Swagger/OpenAPI metadata to the last registered route.
+     *
+     * @param array $meta Swagger metadata (summary, tags, description, example, etc.)
+     * @return $this
+     */
+    public function swagger(array $meta): self
+    {
+        if (self::$lastRouteMethod !== null && self::$lastRouteIndex !== null) {
+            self::$routes[self::$lastRouteMethod][self::$lastRouteIndex]['swagger'] = $meta;
+        }
+        return $this;
+    }
+
+    /**
+     * Mark the last registered route as secure (requires valid JWT).
+     *
+     * @return $this
+     */
+    public function secure(): self
+    {
+        if (self::$lastRouteMethod !== null && self::$lastRouteIndex !== null) {
+            self::$routes[self::$lastRouteMethod][self::$lastRouteIndex]['secure'] = true;
+        }
+        return $this;
+    }
+
+    /**
+     * Opt out of secure-by-default auth on a write route (POST/PUT/PATCH/DELETE).
+     *
+     * Write routes require a valid Bearer JWT by default. Call noAuth() to
+     * mark the route as publicly accessible without a token.
+     *
+     * @return $this
+     */
+    public function noAuth(): self
+    {
+        if (self::$lastRouteMethod !== null && self::$lastRouteIndex !== null) {
+            self::$routes[self::$lastRouteMethod][self::$lastRouteIndex]['noAuth'] = true;
+        }
+        return $this;
+    }
+
+    /**
+     * Match a request method and path to a registered route.
+     *
+     * @return array{route: array, params: array<string, string>}|null
+     */
+    public static function match(string $method, string $path): ?array
+    {
+        $method = strtoupper($method);
+        $path = '/' . trim($path, '/');
+
+        // RFC 9110 §9.3.2: HEAD is identical to GET except no body. If the
+        // app didn't register a dedicated HEAD route, transparently fall
+        // back to the GET route. dispatchInner strips the body on the way
+        // out so the handler doesn't need to know HEAD even happened.
+        if ($method === 'HEAD' && empty(self::$routes['HEAD']) && !empty(self::$routes['GET'])) {
+            return self::matchInTable('GET', $path);
+        }
+
+        if (!isset(self::$routes[$method])) {
+            return null;
+        }
+
+        return self::matchInTable($method, $path);
+    }
+
+    /**
+     * Detect Express-style "function middleware" — a Closure (or other
+     * non-class callable) that declares 3+ parameters. The third is the
+     * `$next` continuation; the middleware calls `$next($req, $resp)` to
+     * descend into the chain, or returns its own Response to
+     * short-circuit. Class-string middleware (resolved via class_exists)
+     * is dispatched separately via the before_ / after_ method pattern.
+     *
+     * Two-arg closures keep the legacy "filter" behaviour: run inline,
+     * return false/Response to short-circuit. tina4-book#141 PY-10-01.
+     */
+    private static function isFunctionMiddleware(mixed $mw): bool
+    {
+        // Class strings → before_ / after_ dispatch, not function-style.
+        if (is_string($mw)) {
+            return false;
+        }
+        if (!($mw instanceof \Closure) && !is_callable($mw)) {
+            return false;
+        }
+        try {
+            $ref = $mw instanceof \Closure
+                ? new \ReflectionFunction($mw)
+                : new \ReflectionMethod($mw, '__invoke');
+        } catch (\Throwable) {
+            return false;
+        }
+        return $ref->getNumberOfParameters() >= 3;
+    }
+
+    /**
+     * Resolve a string middleware spec to an Express-style continuation
+     * closure, or null if the string is not a known parameterised middleware.
+     *
+     * Mirrors Python's `_resolve_string_middleware` registry. Accepts:
+     *   "ResponseCache"      → ResponseCache with default TTL
+     *   "ResponseCache:300"  → ResponseCache with ttl=300
+     *
+     * The returned closure ($req, $resp, $next) delegates to
+     * ResponseCache::handle(), which short-circuits with a cached HIT
+     * (skipping $next) or runs the handler via $next and stores the result on
+     * a MISS — stamping X-Cache / X-Cache-TTL in both paths. This is the path
+     * the dispatcher actually invokes (function-style middleware), so the
+     * headers land on both the hit and miss responses the dispatcher returns.
+     *
+     * Unknown / plain class-name strings return null so the caller's
+     * before_* static-method loop handles them unchanged.
+     */
+    private static function resolveStringMiddleware(string $spec): ?\Closure
+    {
+        $head = strstr($spec, ':', true);
+        $name = $head !== false ? $head : $spec;
+        $tail = $head !== false ? substr($spec, strlen($head) + 1) : '';
+
+        // Registry of string-addressable instance middleware (parity with
+        // Python). Only ResponseCache participates today; add entries here as
+        // other instance middleware gain string specs.
+        if ($name !== 'ResponseCache') {
+            return null;
+        }
+
+        // Memoise one continuation per spec. Python resolves the string once at
+        // route-registration time, so a single ResponseCache instance (and its
+        // backend) is reused across requests — that is what makes the cache
+        // actually hit on the 2nd request. PHP resolves per dispatch, so cache
+        // the closure here to get the same single-instance behaviour.
+        if (isset(self::$resolvedStringMiddleware[$spec])) {
+            return self::$resolvedStringMiddleware[$spec];
+        }
+
+        // Parse the first colon-arg as the TTL (e.g. "ResponseCache:300").
+        $config = [];
+        if ($tail !== '') {
+            $firstArg = strstr($tail, ':', true);
+            $ttlArg = $firstArg !== false ? $firstArg : $tail;
+            if (is_numeric($ttlArg)) {
+                $config['ttl'] = (int) $ttlArg;
+            }
+        }
+
+        $cache = new \Tina4\Middleware\ResponseCache($config);
+
+        // ResponseCache::handle() is a self-contained continuation: lookup +
+        // HIT short-circuit + MISS store, stamping X-Cache headers in every
+        // path, without mutating the Request.
+        $closure = static function (Request $request, Response $response, callable $next) use ($cache): mixed {
+            return $cache->handle($request, $response, $next);
+        };
+        self::$resolvedStringMiddleware[$spec] = $closure;
+        return $closure;
+    }
+
+    /**
+     * Match a path against the route table for a single, already-uppercased
+     * method. Extracted so HEAD's auto-fallback can reuse the GET table
+     * without duplicating the param-extraction logic.
+     */
+    private static function matchInTable(string $method, string $path): ?array
+    {
+        foreach (self::$routes[$method] as $route) {
+            if (preg_match($route['regex'], $path, $matches)) {
+                $params = [];
+
+                // Extract named parameters with type casting
+                $types = $route['paramTypes'] ?? [];
+                foreach ($route['paramNames'] as $name) {
+                    if (isset($matches[$name])) {
+                        $value = $matches[$name];
+                        $type = $types[$name] ?? 'string';
+                        $params[$name] = match ($type) {
+                            'int', 'integer' => (int) $value,
+                            'float', 'number' => (float) $value,
+                            default => $value,
+                        };
+                    }
+                }
+
+                // Extract catch-all parameter
+                if ($route['catchAll'] && $route['catchAllName'] !== null) {
+                    if ($route['catchAllName'] === '*' && isset($matches['__wildcard__'])) {
+                        $params['*'] = $matches['__wildcard__'];
+                    } elseif (isset($matches[$route['catchAllName']])) {
+                        $params[$route['catchAllName']] = $matches[$route['catchAllName']];
+                    }
+                }
+
+                return [
+                    'route' => $route,
+                    'params' => $params,
+                ];
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Return the list of HTTP methods registered for a given path, in the
+     * order they appear in $ALL_METHODS. Used by dispatchInner to build the
+     * `Allow:` header on 405 / OPTIONS responses (RFC 9110 §10.2.1, §9.3.7).
+     *
+     * If GET is registered for the path, HEAD and OPTIONS are appended
+     * implicitly — the framework handles those automatically, so they
+     * count as supported even without explicit registration.
+     *
+     * @return string[] e.g. ['GET', 'POST', 'HEAD', 'OPTIONS']
+     */
+    private static function methodsAllowedForPath(string $path): array
+    {
+        $path = '/' . trim($path, '/');
+        $methods = [];
+
+        foreach (['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'] as $m) {
+            if (empty(self::$routes[$m])) {
+                continue;
+            }
+            foreach (self::$routes[$m] as $route) {
+                if (preg_match($route['regex'], $path)) {
+                    $methods[] = $m;
+                    break;
+                }
+            }
+        }
+
+        // GET implies HEAD and OPTIONS auto-handling. Always append them
+        // (without duplicates) whenever any concrete method exists for
+        // the path — every path the router knows about supports OPTIONS,
+        // and any path with GET supports HEAD.
+        if (!empty($methods)) {
+            if (in_array('GET', $methods, true) && !in_array('HEAD', $methods, true)) {
+                $methods[] = 'HEAD';
+            }
+            if (!in_array('OPTIONS', $methods, true)) {
+                $methods[] = 'OPTIONS';
+            }
+        }
+
+        return $methods;
+    }
+
+    /**
+     * Dispatch a request — match, run middleware, invoke handler.
+     */
+    public static function dispatch(Request $request, Response $response): Response
+    {
+        // v3.13.14: stamp the request start so we can log elapsed time below.
+        $reqStart = microtime(true);
+
+        // Request-scoped DB query cache (default-on). Tina4 PHP runs a
+        // LONG-RUNNING built-in server, so in-memory cache state persists
+        // across requests. Clear the request-scoped layer on every live
+        // connection at the START of each request so cached rows never leak
+        // across requests (zero cross-request staleness). Persistent-mode
+        // connections (TINA4_DB_CACHE=true) are left untouched. Every server
+        // path — built-in Server, Swoole, RoadRunner, PHP-FPM — funnels
+        // through dispatch(), so this is the universal request entry point.
+        \Tina4\Database\CachedDatabase::resetRequestCaches();
+
+        // Start PHP's native session so $_SESSION writes persist across
+        // requests on every SAPI — Apache + PHP-FPM, FastCGI, CGI,
+        // command-line — not just on the built-in dev server.
+        //
+        // Why this matters: PHP's default `session.auto_start = Off`
+        // means $_SESSION is a transient empty array unless something
+        // calls `session_start()`. The `php -S` built-in server
+        // behaves as if auto_start were On for convenience, which
+        // masks the bug in local development — code that reads or
+        // writes $_SESSION works fine locally, then silently loses
+        // every value when deployed to shared hosting.
+        //
+        // Tina4's own $request->session API (backed by the
+        // tina4_session cookie + data/sessions/*.json files) is
+        // untouched by this call; both coexist. We just make sure
+        // native sessions are wired so existing app code that uses
+        // $_SESSION directly — login flows, booking flows,
+        // third-party integrations — keeps working.
+        //
+        // Storage: configurable via TINA4_PHP_SESSION_PATH (default:
+        // data/sessions-php/ under the project root so shared-hosting
+        // /tmp quotas don't surprise us). Cookie name via
+        // TINA4_PHP_SESSION_NAME (default: PHPSESSID, PHP's default).
+        //
+        // Fixes tina4stack/tina4-php#112.
+        if (session_status() === PHP_SESSION_NONE && !headers_sent()) {
+            // Router::$basePath is set by App::__construct, so falling
+            // back to getcwd() is defensive for code paths that use
+            // Router::dispatch() directly in tests without booting an
+            // App instance first.
+            $basePath = self::$basePath !== '.' ? self::$basePath : getcwd();
+            $sessionPath = getenv('TINA4_PHP_SESSION_PATH')
+                ?: ($basePath . DIRECTORY_SEPARATOR . 'data' . DIRECTORY_SEPARATOR . 'sessions-php');
+            if (!is_dir($sessionPath)) {
+                @mkdir($sessionPath, 0755, true);
+            }
+            if (is_writable($sessionPath)) {
+                session_save_path($sessionPath);
+            }
+            $sessionName = getenv('TINA4_PHP_SESSION_NAME') ?: 'PHPSESSID';
+            session_name($sessionName);
+            @session_start();
+        }
+
+        // Auto-start Tina4's own session — read session ID from cookie,
+        // lazy-create on first use. This is independent of $_SESSION
+        // above; both share nothing but coexist without conflict.
+        $sessionCookie = $_COOKIE['tina4_session'] ?? null;
+        $session = new Session();
+        $session->start($sessionCookie);
+        $request->session = $session;
+
+        $result = self::dispatchInner($request, $response);
+
+        // Save session and set cookie after handler runs
+        $session->save();
+
+        // Probabilistic garbage collection (~1% of requests)
+        if (random_int(1, 100) === 1) {
+            try {
+                $session->gc();
+            } catch (\Throwable) {
+                // GC failure is non-critical — silently ignore
+            }
+        }
+        $sid = $session->getSessionId();
+        if ($sid && $sid !== $sessionCookie) {
+            $ttl = (int)(getenv('TINA4_SESSION_TTL') ?: 3600);
+            $sameSite = getenv('TINA4_SESSION_SAMESITE') ?: 'Lax';
+            // SameSite=None requires the Secure flag — browsers reject it otherwise
+            $secure = strcasecmp($sameSite, 'None') === 0 || (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off');
+
+            if (headers_sent()) {
+                // Built-in server mode: headers are managed via the Response object,
+                // so setcookie() would trigger a fatal error. Build the Set-Cookie
+                // header manually and attach it to the Response instead.
+                $expires = gmdate('D, d M Y H:i:s T', time() + $ttl);
+                $cookie = "tina4_session={$sid}; Expires={$expires}; Path=/; HttpOnly; SameSite={$sameSite}";
+                if ($secure) {
+                    $cookie .= '; Secure';
+                }
+                $result->header('Set-Cookie', $cookie);
+            } else {
+                // Apache/nginx/FPM mode: use PHP's native setcookie()
+                setcookie('tina4_session', $sid, [
+                    'expires' => time() + $ttl,
+                    'path' => '/',
+                    'httponly' => true,
+                    'samesite' => $sameSite,
+                    'secure' => $secure,
+                ]);
+            }
+        }
+
+        // RFC 9110 §9.3.2: the server MUST NOT send content in a HEAD
+        // response. Apply unconditionally — even an explicit Router::head()
+        // handler that accidentally returned a body gets the body stripped
+        // here, so the framework can't ship a non-conformant HEAD response
+        // no matter what the handler did.
+        //
+        // Content-Length is preserved (as the byte count the GET-equivalent
+        // body WOULD have been) so cache validators, link checkers, and
+        // monitoring probes get useful size information from the HEAD probe.
+        // RFC 9110 §9.3.2 SHOULD — same headers as the equivalent GET.
+        if (strtoupper($request->method) === 'HEAD') {
+            $body = $result->getBody();
+            if ($body !== '') {
+                $result->header('Content-Length', (string) strlen($body));
+                $result->setBody('');
+            }
+        }
+
+        // Request log line (v3.13.14). On by default in dev (so `tina4 serve`
+        // shows request activity on stdout), opt-in in production via
+        // TINA4_LOG_REQUESTS. Routed through Tina4\Log so it lands on stdout
+        // like every other log. Same format across all four frameworks.
+        if (self::requestLoggingEnabled()) {
+            $elapsed = round((microtime(true) - $reqStart) * 1000, 3);
+            $status = $result->getStatusCode();
+            Log::info("{$request->method} {$request->path} -> {$status} ({$elapsed}ms)");
+        }
+
+        return $result;
+    }
+
+    /**
+     * Whether to emit a per-request log line (v3.13.14).
+     *
+     * TINA4_LOG_REQUESTS is the explicit control (true/false). When unset,
+     * request logging follows dev mode: on under TINA4_DEBUG, off in
+     * production. Same contract across all four frameworks.
+     */
+    private static function requestLoggingEnabled(): bool
+    {
+        $val = DotEnv::getEnv('TINA4_LOG_REQUESTS');
+        if ($val !== null && $val !== '') {
+            return DotEnv::isTruthy($val);
+        }
+        return DotEnv::isTruthy(DotEnv::getEnv('TINA4_DEBUG', 'false'));
+    }
+
+    /**
+     * Inner dispatch — handles route matching, middleware, and handler invocation.
+     */
+    private static function dispatchInner(Request $request, Response $response): Response
+    {
+        // TINA4_TRAILING_SLASH_REDIRECT — when truthy, any path with a trailing
+        // slash (other than the bare "/") redirects 301 to the slash-stripped
+        // form. Lets operators normalize URLs without per-route boilerplate.
+        if (
+            $request->path !== '/'
+            && str_ends_with($request->path, '/')
+            && DotEnv::isTruthy(DotEnv::getEnv('TINA4_TRAILING_SLASH_REDIRECT', 'false'))
+        ) {
+            $target = rtrim($request->path, '/');
+            // Preserve query string when present
+            if (!empty($request->query)) {
+                $target .= '?' . http_build_query($request->query);
+            }
+            return $response->redirect($target, 301);
+        }
+
+        // Run global middleware "before" hooks.
+        // CORS middleware runs first (separate pass) so CORS headers are always present —
+        // even on short-circuited 4xx responses. This is required by the CORS spec: browsers
+        // must see CORS headers on 401/403 responses or they report a CORS error instead.
+        $globalMiddleware = Middleware::getGlobal();
+        if (!empty($globalMiddleware)) {
+            $corsMiddleware = array_filter($globalMiddleware, fn($c) => is_a($c, \Tina4\Middleware\CorsMiddleware::class, true));
+            $otherMiddleware = array_filter($globalMiddleware, fn($c) => !is_a($c, \Tina4\Middleware\CorsMiddleware::class, true));
+
+            if (!empty($corsMiddleware)) {
+                [$request, $response] = Middleware::runBefore(array_values($corsMiddleware), $request, $response);
+            }
+
+            if (!empty($otherMiddleware)) {
+                [$request, $response] = Middleware::runBefore(array_values($otherMiddleware), $request, $response);
+            }
+
+            // Short-circuit if a global middleware set a non-default status.
+            // Covers both error responses (4xx/5xx) and CORS preflight (204).
+            $statusCode = $response->getStatusCode();
+            if ($statusCode >= 400 || $statusCode === 204) {
+                return $response;
+            }
+        }
+
+        $result = self::match($request->method, $request->path);
+
+        if ($result === null) {
+            // RFC 9110 conformance — if the path itself has registered methods
+            // but the request's method isn't one of them, we owe the client
+            // 405 (not 404) with an Allow header. §15.5.6 + §10.2.1.
+            //
+            // OPTIONS gets special handling: §9.3.7 says an OPTIONS request to
+            // an existing resource returns 204 No Content with the same Allow
+            // header. We treat it as a 204-shaped 405 — same scan, different
+            // status — so the client can discover the resource's method set.
+            //
+            // TRACE and CONNECT (and any other unknown methods like PROPFIND)
+            // fall into this path naturally when the resource exists — they
+            // get 405, never 200, because the framework deliberately doesn't
+            // ship handlers for them.
+            $allowedMethods = self::methodsAllowedForPath($request->path);
+            if (!empty($allowedMethods)) {
+                $allowHeader = implode(', ', $allowedMethods);
+                if (strtoupper($request->method) === 'OPTIONS') {
+                    $response->header('Allow', $allowHeader);
+                    // 204 No Content — OPTIONS responses have no body by
+                    // convention. Use status setter, not the JSON helper,
+                    // so body stays empty.
+                    return $response->status(204);
+                }
+                $errorResp = self::renderError($response, 405, 'Method Not Allowed', $request->path);
+                $errorResp->header('Allow', $allowHeader);
+                return self::injectDevToolbar($request, $errorResp, 'error');
+            }
+
+            // Path is genuinely unknown — try static file before 404.
+            $staticResponse = StaticFiles::tryServe($request->path, self::$basePath);
+            if ($staticResponse !== null) {
+                return $staticResponse;
+            }
+
+            // Try serving a template file (e.g. /hello -> src/templates/hello.twig or hello.html)
+            // HEAD on a template path falls back here too, matching GET's behaviour.
+            if ($request->method === 'GET' || $request->method === 'HEAD') {
+                $tplFile = self::resolveTemplate($request->path);
+                if ($tplFile !== null) {
+                    return $response->render($tplFile, []);
+                }
+            }
+
+            $errorResp = self::renderError($response, 404, 'Not Found', $request->path);
+            return self::injectDevToolbar($request, $errorResp, 'error');
+        }
+
+        $route = $result['route'];
+        $request->params = $result['params'];
+
+        // Expose the matched route's metadata on the request BEFORE any
+        // middleware runs, so a middleware can read handler-level flags such
+        // as `noAuth`. CsrfMiddleware skips a route marked ->noAuth() / @noauth
+        // by reading `$request->handler['noAuth']`; without this assignment
+        // `$request->handler` stayed null and that bypass was DEAD CODE on a
+        // real dispatch — a @noauth POST guarded by CsrfMiddleware would be
+        // wrongly blocked with 403 (tina4-python parity: request._handler).
+        $request->handler = $route;
+
+        // ── Auth enforcement ──────────────────────────────────────
+        // Dev admin routes (/__dev/) are always public — no auth required.
+        // Write routes (POST/PUT/PATCH/DELETE) are secure by default.
+        // Use ->noAuth() or @noauth to opt out.
+        // GET/HEAD/OPTIONS are open by default; use ->secure() or @secured to require auth.
+        //
+        // Note: presence of custom middleware does NOT relax this gate
+        // (tina4-book#141 PY-10-02 parity fix). Pre-3.13.2 PHP silently
+        // opened write routes the moment any logging/CORS middleware was
+        // attached. Middleware is now purely additive — developers
+        // explicitly open routes with ->noAuth() and lock GETs with
+        // ->secure().
+        // Match on $request->path (the path portion, e.g. "/__dev/api/reload"),
+        // NOT $request->url (the full "scheme://host/path" — which never starts
+        // with "/__dev" so the bypass silently never fired and write routes
+        // under /__dev returned 401). The trailing-slash redirect branch above
+        // already uses $request->path; this aligns with it.
+        $isDevAdmin = str_starts_with($request->path, '/__dev') || str_starts_with($request->path, '/api/gallery/') || str_starts_with($request->path, '/gallery/');
+        $isWriteMethod = in_array($request->method, ['POST', 'PUT', 'PATCH', 'DELETE'], true);
+        $requiresAuth = false;
+
+        if ($isDevAdmin) {
+            // Dev admin routes never require auth
+            $requiresAuth = false;
+        } elseif ($isWriteMethod) {
+            // Write routes require auth unless ->noAuth()
+            $requiresAuth = empty($route['noAuth']);
+        } else {
+            // Read routes require auth only when explicitly marked secure
+            $requiresAuth = !empty($route['secure']);
+        }
+
+        if ($requiresAuth) {
+            $token = null;
+            $tokenSource = null;
+
+            // Priority 1: Authorization Bearer header
+            $bearerToken = $request->bearerToken();
+            if ($bearerToken !== null) {
+                $token = $bearerToken;
+                $tokenSource = 'header';
+            }
+
+            // Priority 2: formToken in request body
+            if ($token === null && is_array($request->body) && !empty($request->body['formToken'])) {
+                $token = $request->body['formToken'];
+                $tokenSource = 'body';
+            }
+
+            // Priority 3: Session token
+            if ($token === null && $request->session !== null && $request->session->has('token')) {
+                $token = $request->session->get('token');
+                $tokenSource = 'session';
+            }
+
+            if ($token === null) {
+                return $response->json(['error' => 'Unauthorized'], 401);
+            }
+
+            // Pass token only — Auth::validToken resolves SECRET consistently
+            // ($_ENV first, then getenv). Pre-resolving here with `getenv()` only
+            // would mismatch Auth::getToken's resolution and reject valid tokens
+            // whenever $_ENV['SECRET'] differs from getenv('SECRET') (e.g. when
+            // .env loads SECRET into $_ENV but a test or runtime override calls
+            // putenv with a different value).
+            if (!Auth::validToken($token)) {
+                return $response->json(['error' => 'Unauthorized'], 401);
+            }
+
+            // Attach decoded JWT payload to the request for downstream use
+            $request->user = Auth::getPayload($token);
+
+            // When body formToken validates, return a FreshToken header so
+            // frond.js can use the Authorization header on subsequent requests
+            if ($tokenSource === 'body') {
+                $freshToken = Auth::refreshToken($token);
+                if ($freshToken !== null) {
+                    $response->header('FreshToken', $freshToken);
+                }
+            }
+        }
+
+        // Split middleware into two groups:
+        //   - class-style (string class names) → before_*/before static
+        //     methods run inline before the handler. Two-arg closures
+        //     ($req, $resp) are also treated as "filter" style here.
+        //   - function-style continuation middleware (closures/callables
+        //     declaring 3+ parameters: $req, $resp, $next). These wrap
+        //     the route handler Express-style — each one calls $next to
+        //     descend, or returns early to short-circuit. This is the
+        //     pattern documented in chapter 10 for 8+ examples; pre-3.13.2
+        //     PHP silently ignored the $next argument and ran them as
+        //     two-arg filters, which made the example bodies dead code.
+        //     tina4-book#141 PY-10-01 parity fix.
+        $functionMiddlewares = [];
+        foreach ($route['middleware'] as $mw) {
+            // String specs for known instance middleware ("ResponseCache",
+            // "ResponseCache:300") resolve to an Express-style continuation
+            // that runs the instance's before/after hooks around the handler.
+            // Parity with Python's _resolve_string_middleware registry. Returns
+            // null for plain class strings (handled by the before_* loop below).
+            if (is_string($mw)) {
+                $resolved = self::resolveStringMiddleware($mw);
+                if ($resolved !== null) {
+                    $mw = $resolved;
+                }
+            }
+            if (self::isFunctionMiddleware($mw)) {
+                $functionMiddlewares[] = $mw;
+                continue;
+            }
+            // Resolve middleware: string class name → call before() methods (Python parity)
+            if (is_string($mw)) {
+                // Try as class name (exact, PascalCase, or ucfirst)
+                $className = null;
+                foreach ([$mw, ucfirst($mw)] as $candidate) {
+                    if (class_exists($candidate)) {
+                        $className = $candidate;
+                        break;
+                    }
+                }
+
+                if ($className !== null) {
+                    // Call all before_* / before static methods. Definition
+                    // order is preserved (get_class_methods returns declaration
+                    // order) — never alphabetical. Each invocation is wrapped:
+                    // a throwing before* is logged + converted to a clean 500
+                    // (M2), never an unhandled crash.
+                    $methods = get_class_methods($className);
+                    foreach ($methods as $method) {
+                        if (str_starts_with($method, 'before')) {
+                            try {
+                                $mwResult = $className::$method($request, $response);
+                            } catch (\Throwable $error) {
+                                return Middleware::middleware500($response, $className, $method, $error);
+                            }
+                            if ($mwResult instanceof Response) {
+                                return $mwResult;
+                            }
+                            if ($mwResult === false) {
+                                $errorResp = self::renderError($response, 403, 'Forbidden', $request->path);
+                                return self::injectDevToolbar($request, $errorResp, 'error');
+                            }
+                            // If middleware returns [request, response], update them
+                            if (is_array($mwResult) && count($mwResult) === 2) {
+                                [$request, $response] = $mwResult;
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                // Fallback: try as callable function name
+                if (is_callable($mw)) {
+                    try {
+                        $mwResult = $mw($request, $response);
+                    } catch (\Throwable $error) {
+                        return Middleware::middleware500($response, 'Closure', '__invoke', $error);
+                    }
+                } else {
+                    Log::warning("Middleware not found: {$mw}");
+                    continue;
+                }
+            } elseif (is_callable($mw)) {
+                try {
+                    $mwResult = $mw($request, $response);
+                } catch (\Throwable $error) {
+                    return Middleware::middleware500($response, 'Closure', '__invoke', $error);
+                }
+            } else {
+                continue;
+            }
+
+            // If middleware returns a Response, short-circuit
+            if ($mwResult instanceof Response) {
+                return $mwResult;
+            }
+            // If middleware returns false, stop processing
+            if ($mwResult === false) {
+                $errorResp = self::renderError($response, 403, 'Forbidden', $request->path);
+                return self::injectDevToolbar($request, $errorResp, 'error');
+            }
+        }
+
+        // Build the route handler invocation as a closure so function-style
+        // middleware can wrap it Express-style. Each middleware in
+        // $functionMiddlewares is given a $next continuation that either
+        // invokes the next layer or — at the innermost layer — runs the
+        // actual route callback. Iteration is reversed so the first
+        // declared middleware ends up as the outermost wrapper.
+        $invokeRouteHandler = function (Request $request, Response $response) use ($route): mixed {
+            $ref = new \ReflectionFunction($route['callback']);
+            $refParams = $ref->getParameters();
+            $routeParams = $request->params;
+            $args = [];
+
+            foreach ($refParams as $p) {
+                $name = $p->getName();
+                if (array_key_exists($name, $routeParams)) {
+                    // Path parameter — inject by name
+                    $args[] = $routeParams[$name];
+                } else {
+                    // Not a path param — inject request or response based on type hint
+                    $type = $p->getType();
+                    $typeName = $type instanceof \ReflectionNamedType ? $type->getName() : '';
+                    if ($typeName === Request::class || $typeName === 'Tina4\\Request' || $name === 'request') {
+                        $args[] = $request;
+                    } else {
+                        $args[] = $response;
+                    }
+                }
+            }
+
+            return count($args) === 0
+                ? ($route['callback'])()
+                : ($route['callback'])(...$args);
+        };
+
+        $handlerChain = $invokeRouteHandler;
+        foreach (array_reverse($functionMiddlewares) as $mw) {
+            $next = $handlerChain;
+            $handlerChain = static function (Request $req, Response $resp) use ($mw, $next): mixed {
+                return $mw($req, $resp, $next);
+            };
+        }
+
+        try {
+            $handlerResult = $handlerChain($request, $response);
+        } catch (\Throwable $e) {
+            // v3.13.7: Surface route failures to observability (CloudWatch,
+            // Sentry, etc.) BEFORE rendering the 500. Listeners get the
+            // canonical {exception, request} pair — same shape as Python /
+            // Ruby / Node. Listener throws are swallowed + warning-logged
+            // so a broken listener can't break the 500 page.
+            Log::error(sprintf(
+                'Route error: %s: %s',
+                $e::class,
+                $e->getMessage()
+            ), [
+                'method' => $request->method ?? null,
+                'path'   => $request->path ?? null,
+            ]);
+            try {
+                Events::emit('tina4.request.error', [
+                    'exception' => $e,
+                    'request'   => $request,
+                ]);
+            } catch (\Throwable $listenerErr) {
+                try {
+                    Log::warning(sprintf(
+                        'Listener for tina4.request.error raised: %s: %s',
+                        $listenerErr::class,
+                        $listenerErr->getMessage()
+                    ));
+                } catch (\Throwable) {
+                    // Log failures must never block the 500 render.
+                }
+            }
+
+            if (ErrorOverlay::isDebugMode()) {
+                // Rich error overlay with stack trace, source context, and line numbers
+                $overlayHtml = ErrorOverlay::renderErrorOverlay($e, [
+                    'REQUEST_METHOD' => $request->method,
+                    'REQUEST_URI' => $request->path,
+                    'CONTENT_TYPE' => $request->contentType ?? '',
+                    'REMOTE_ADDR' => $request->ip ?? '',
+                    'QUERY_STRING' => $request->query ?? '',
+                    'headers' => $request->headers ?? [],
+                    'params' => $request->params ?? [],
+                    'body' => is_array($request->body) ? $request->body : [],
+                ]);
+                return $response->html($overlayHtml, 500);
+            }
+            // v3.13.7 SECURITY (CWE-209): production response body must
+            // NOT contain the stack trace. The trace stays in Log::error
+            // above and in any listener consumers. Clients only see the
+            // generic page + request_id.
+            $errorResp = self::renderError($response, 500, 'Server Error', $request->path, [
+                'error_message' => '',
+                'request_id'    => substr(md5(uniqid('', true)), 0, 12),
+            ]);
+            return self::injectDevToolbar($request, $errorResp, 'error');
+        }
+
+        if ($handlerResult instanceof Response) {
+            $finalResponse = $handlerResult;
+        } elseif (is_array($handlerResult)) {
+            $finalResponse = $response->json($handlerResult);
+        } elseif (is_string($handlerResult)) {
+            $finalResponse = $response->html($handlerResult);
+        } else {
+            $finalResponse = $response;
+        }
+
+        // Run global middleware "after" hooks
+        if (!empty($globalMiddleware)) {
+            [$request, $finalResponse] = Middleware::runAfter($globalMiddleware, $request, $finalResponse);
+        }
+
+        // Dev toolbar injection — also covers 404 / 403 / 500 paths via
+        // injectDevToolbar() helper called from those return sites above.
+        $matchedPattern = $result !== null ? ($result['route']['pattern'] ?? '') : 'none';
+        $finalResponse = self::injectDevToolbar($request, $finalResponse, $matchedPattern);
+
+        // Tier 4: customer feedback widget injection. Runs AFTER the dev
+        // toolbar so its <script> sits next to the toolbar's marker tags —
+        // both target the LAST </body> independently and are idempotent.
+        // No-op when TINA4_ENABLE_FEEDBACK / TINA4_FEEDBACK_WHITELIST aren't
+        // both set, or when the requesting user isn't on the list.
+        return self::injectFeedbackWidget($request, $finalResponse);
+    }
+
+    /**
+     * Inject the customer feedback widget <script> into HTML responses for
+     * whitelisted users. Mirrors {@see injectDevToolbar()} content-type +
+     * dev-path gating — the actual whitelist/marker logic lives in
+     * {@see Feedback::injectFeedbackWidget()}.
+     */
+    private static function injectFeedbackWidget(Request $request, Response $finalResponse): Response
+    {
+        $contentType = $finalResponse->getContentType() ?? '';
+        if (!str_contains($contentType, 'text/html')) {
+            return $finalResponse;
+        }
+        $body = $finalResponse->getBody();
+        if (!str_contains($body, '</body>')) {
+            return $finalResponse;
+        }
+        $injected = Feedback::injectFeedbackWidget($request, $body);
+        if ($injected !== $body) {
+            $finalResponse->setBody($injected);
+        }
+        return $finalResponse;
+    }
+
+    /**
+     * Inject the dev toolbar into an HTML response when TINA4_DEBUG is on
+     * and the path isn't itself a /__dev internal. Pulled out so 404 / 403
+     * / 500 error pages still get the toolbar (was missing before — users
+     * hitting an unknown route saw a bare error page and assumed the dev
+     * admin had broken).
+     */
+    private static function injectDevToolbar(Request $request, Response $finalResponse, string $matchedPattern = 'none'): Response
+    {
+        $isDev = DotEnv::isTruthy(DotEnv::getEnv('TINA4_DEBUG', 'false'));
+        if (!$isDev) {
+            return $finalResponse;
+        }
+        if (str_starts_with($request->path, '/__dev')) {
+            return $finalResponse;
+        }
+        $contentType = $finalResponse->getContentType() ?? '';
+        if (!str_contains($contentType, 'text/html')) {
+            return $finalResponse;
+        }
+        $requestId = Log::getRequestId() ?? '';
+        $toolbar = DevAdmin::renderToolbar(
+            method: $request->method,
+            path: $request->path,
+            matchedPattern: $matchedPattern,
+            requestId: $requestId,
+            routeCount: self::count(),
+        );
+        $body = $finalResponse->getBody();
+        if (str_contains($body, '</body>')) {
+            $finalResponse->setBody(str_replace('</body>', $toolbar . "\n</body>", $body));
+        } else {
+            $finalResponse->setBody($body . $toolbar);
+        }
+        return $finalResponse;
+    }
+
+    /**
+     * Get all registered routes as a flat list for CLI/debug.
+     *
+     * @return array<int, array{method: string, pattern: string, middleware: int, cache: bool, secure: bool}>
+     */
+    public static function getRoutes(): array
+    {
+        $list = [];
+
+        foreach (self::$routes as $method => $routes) {
+            foreach ($routes as $route) {
+                // Derive handler name and module from the callback
+                $handler = '';
+                $module = '';
+                $cb = $route['callback'];
+                if ($cb instanceof \Closure) {
+                    $ref = new \ReflectionFunction($cb);
+                    $file = $ref->getFileName();
+                    $handler = $file ? basename($file) . ':' . $ref->getStartLine() : 'Closure';
+                    $module = $file ? dirname($file) : '';
+                } elseif (is_string($cb)) {
+                    $handler = $cb;
+                } elseif (is_array($cb) && count($cb) === 2) {
+                    $handler = (is_object($cb[0]) ? get_class($cb[0]) : $cb[0]) . '::' . $cb[1];
+                }
+                $list[] = [
+                    'method' => $method,
+                    'pattern' => $route['pattern'],
+                    'path' => $route['pattern'],
+                    'middleware' => count($route['middleware']),
+                    'cache' => $route['cache'],
+                    'secure' => $route['secure'],
+                    // Expose the fluent ->noAuth() flag so consumers (Swagger) can
+                    // honour the write-secure-by-default rule. Without this key the
+                    // Swagger generator's empty($route['noAuth']) was always true and
+                    // a ->noAuth() write route was still documented as requiring auth.
+                    'noAuth' => $route['noAuth'] ?? false,
+                    'auth_required' => $route['secure'] && !($route['noAuth'] ?? false),
+                    'handler' => $handler,
+                    'module' => $module,
+                    'callback' => $route['callback'],
+                    'swagger' => $route['swagger'] ?? [],
+                ];
+            }
+        }
+
+        // Include WebSocket routes
+        foreach (self::$wsRoutes as $wsRoute) {
+            $list[] = [
+                'method' => 'WS',
+                'pattern' => $wsRoute['path'],
+                'path' => $wsRoute['path'],
+                'middleware' => 0,
+                'cache' => false,
+                'secure' => $wsRoute['secure'] ?? false,
+                'auth_required' => $wsRoute['auth_required'] ?? ($wsRoute['secure'] ?? false),
+                'handler' => '',
+                'module' => '',
+            ];
+        }
+
+        return $list;
+    }
+
+    /** Alias for getRoutes(). */
+    public static function listRoutes(): array
+    {
+        return self::getRoutes();
+    }
+
+    /**
+     * Get the number of registered routes (including WebSocket routes).
+     */
+    public static function count(): int
+    {
+        $count = 0;
+        foreach (self::$routes as $routes) {
+            $count += count($routes);
+        }
+        $count += count(self::$wsRoutes);
+        return $count;
+    }
+
+    /**
+     * Render an error page via Frond templates with fallback to JSON.
+     *
+     * Resolution order:
+     *   1. User override:    src/templates/errors/{code}.twig
+     *   2. Framework default: __DIR__/templates/errors/{code}.twig
+     *   3. JSON fallback
+     *
+     * @param Response $response The response object
+     * @param int $code HTTP status code
+     * @param string $message Error message
+     * @param string $path Request path (for display in template)
+     * @param array $extraData Additional template variables
+     * @return Response
+     */
+    private static function renderError(Response $response, int $code, string $message, string $path = '', array $extraData = []): Response
+    {
+        $templateFile = "errors/{$code}.twig";
+        $data = array_merge(['path' => $path, 'error_message' => $message], $extraData);
+
+        // 1. Try user override in src/templates/
+        $userTemplateDir = 'src/templates';
+        if (is_file($userTemplateDir . '/' . $templateFile)) {
+            try {
+                $frond = Response::getFrond();
+                $html = $frond->render($templateFile, $data);
+                return $response->html($html, $code);
+            } catch (\Throwable $e) {
+                // Fall through to framework default
+            }
+        }
+
+        // 2. Try framework default in Tina4/templates/
+        $frameworkTemplateDir = __DIR__ . '/templates';
+        if (is_file($frameworkTemplateDir . '/' . $templateFile)) {
+            try {
+                $frond = Response::getFrameworkFrond();
+                $html = $frond->render($templateFile, $data);
+                return $response->html($html, $code);
+            } catch (\Throwable $e) {
+                // Fall through to JSON
+            }
+        }
+
+        // 3. JSON fallback
+        return $response->json(['error' => $message], $code);
+    }
+
+    /**
+     * Register a WebSocket route.
+     *
+     * The handler receives ($connection, $message, $event) where:
+     *   - $connection is a WebSocketConnection object with send(), broadcast(), close()
+     *   - $message is the message payload (null for open/close events)
+     *   - $event is 'open', 'message', or 'close'
+     *
+     * A WebSocket route is PUBLIC by default (mirrors a GET route). It becomes
+     * secured — a valid JWT is required on the upgrade — when either:
+     *   (a) the handler carries an `@secured` docblock annotation, OR
+     *   (b) it is registered with `$secure = true` (imperative form).
+     * Both paths set `auth_required` on the route, which the upgrade entry
+     * points (Server::handleWebSocketUpgrade and WebSocket::handleNewConnection)
+     * enforce via WebSocket::wsAuthorized(). Mirrors Python's @secured() on a WS
+     * handler / route["auth_required"].
+     *
+     * @param string   $path    WebSocket endpoint path (e.g. '/ws/chat')
+     * @param callable $handler Handler function
+     * @param bool     $secure  Force-secure the route imperatively (default false)
+     */
+    public static function websocket(string $path, callable $handler, bool $secure = false): void
+    {
+        $fullPath = self::$groupPrefix . '/' . ltrim($path, '/');
+        $fullPath = '/' . trim($fullPath, '/');
+        $fullPath = preg_replace('#/+#', '/', $fullPath);
+
+        // Parse the handler docblock for @secured (mirrors addRoute()'s parsing
+        // for HTTP routes). Either the docblock OR the imperative $secure flag
+        // marks the route as requiring auth on the upgrade.
+        if (!$secure) {
+            try {
+                $ref = new \ReflectionFunction($handler);
+                $doc = $ref->getDocComment();
+                if ($doc !== false && preg_match('/@secured\b/i', $doc)) {
+                    $secure = true;
+                }
+            } catch (\Throwable) {
+                // Not a closure or reflection failed — leave public.
+            }
+        }
+
+        // Replace in place when the same path is re-registered (latest wins) so
+        // a DevReload re-register doesn't append a stale duplicate.
+        $entry = [
+            'path' => $fullPath,
+            'handler' => $handler,
+            'secure' => $secure,
+            'auth_required' => $secure,
+        ];
+        foreach (self::$wsRoutes as $index => $existing) {
+            if ($existing['path'] === $fullPath) {
+                self::$wsRoutes[$index] = $entry;
+                return;
+            }
+        }
+        self::$wsRoutes[] = $entry;
+    }
+
+    /**
+     * Get all registered WebSocket routes.
+     *
+     * @return array<int, array{path: string, handler: callable}>
+     */
+    public static function getWebSocketRoutes(): array
+    {
+        return self::$wsRoutes;
+    }
+
+    /**
+     * Reset all routes (for testing).
+     */
+    public static function clear(): void
+    {
+        self::$routes = [];
+        self::$wsRoutes = [];
+        self::$groupPrefix = '';
+        self::$groupMiddleware = [];
+        self::$lastRouteIndex = null;
+        self::$lastRouteMethod = null;
+        self::$basePath = '.';
+        self::$resolvedStringMiddleware = [];
+    }
+
+    /**
+     * Register a route.
+     */
+    private static function addRoute(string $method, string $path, callable $handler, array $swagger = [], array $middleware = [], ?string $template = null): self
+    {
+        $fullPath = self::$groupPrefix . '/' . ltrim($path, '/');
+        $fullPath = '/' . trim($fullPath, '/');
+
+        // Avoid double slashes
+        $fullPath = preg_replace('#/+#', '/', $fullPath);
+
+        // Parse the path into a regex
+        $parsed = self::compilePath($fullPath);
+
+        if (!isset(self::$routes[$method])) {
+            self::$routes[$method] = [];
+        }
+
+        // Parse docblock annotations on the callback for @noauth / @secured
+        $noAuth = false;
+        $secure = false;
+        try {
+            $ref = new \ReflectionFunction($handler);
+            $doc = $ref->getDocComment();
+            if ($doc !== false) {
+                if (preg_match('/@noauth\b/i', $doc)) {
+                    $noAuth = true;
+                }
+                if (preg_match('/@secured\b/i', $doc)) {
+                    $secure = true;
+                }
+            }
+        } catch (\Throwable) {
+            // Not a closure or reflection failed — ignore
+        }
+
+        $entry = [
+            'pattern' => $fullPath,
+            'regex' => $parsed['regex'],
+            'paramNames' => $parsed['paramNames'],
+            'paramTypes' => $parsed['paramTypes'],
+            'callback' => $handler,
+            'middleware' => array_merge(self::$groupMiddleware, $middleware),
+            'cache' => false,
+            'secure' => $secure,
+            'noAuth' => $noAuth,
+            'catchAll' => $parsed['catchAll'],
+            'catchAllName' => $parsed['catchAllName'],
+            'swagger' => $swagger,
+            'template' => $template,
+        ];
+
+        // Replace in place when the same (method, path) is registered again —
+        // latest wins. Without this, a re-loaded route file (DevReload editing
+        // an existing handler) would APPEND a duplicate and matchInTable would
+        // keep returning the FIRST (stale) entry, so the edit never takes
+        // effect. Distinct paths keep their original slot, so order and
+        // first-match behaviour are preserved.
+        $existingIndex = null;
+        foreach (self::$routes[$method] as $index => $existing) {
+            if ($existing['pattern'] === $fullPath) {
+                $existingIndex = $index;
+                break;
+            }
+        }
+
+        if ($existingIndex !== null) {
+            self::$routes[$method][$existingIndex] = $entry;
+            self::$lastRouteIndex = $existingIndex;
+        } else {
+            self::$routes[$method][] = $entry;
+            self::$lastRouteIndex = count(self::$routes[$method]) - 1;
+        }
+
+        self::$lastRouteMethod = $method;
+
+        return new self();
+    }
+
+    /**
+     * Compile a route path pattern into a regex.
+     *
+     * Supports:
+     *   {param}     — named parameter (matches one path segment)
+     *   {param:.*}  — catch-all parameter (matches remaining path)
+     *
+     * @return array{regex: string, paramNames: array<string>, catchAll: bool, catchAllName: string|null}
+     */
+    /**
+     * Honour TINA4_TEMPLATE_ROUTING=off|false|0|no|disabled as an explicit
+     * kill switch.
+     *
+     * Default: enabled. Drop a file in src/templates/pages/ and it serves at
+     * the matching URL — the zero-config Tina4 convention. Operators who want
+     * explicit-only routing can set TINA4_TEMPLATE_ROUTING=off and every URL
+     * must be registered via Router::get / Router::post (or be a static file).
+     */
+    public static function isTemplateAutoRoutingEnabled(): bool
+    {
+        $val = strtolower(trim((string) DotEnv::getEnv('TINA4_TEMPLATE_ROUTING', 'on')));
+        return !in_array($val, ['off', 'false', '0', 'no', 'disabled'], true);
+    }
+
+    /**
+     * Reset the template cache. Used by tests so each test sees a fresh scan.
+     */
+    public static function resetTemplateCache(): void
+    {
+        self::$templateCache = null;
+    }
+
+    /**
+     * Resolve a URL path to a template file in src/templates/pages/.
+     *
+     * Only files inside src/templates/pages/ auto-route from a URL. Anything
+     * in src/templates/ outside pages/ (partials, layouts, base.twig, errors,
+     * components) is never served standalone.
+     *
+     * Dev mode: checks filesystem every time for live changes.
+     * Production: uses a cached lookup built once at startup.
+     *
+     * The whole feature can be turned off with TINA4_TEMPLATE_ROUTING=off.
+     */
+    public static function resolveTemplate(string $path): ?string
+    {
+        if (!self::isTemplateAutoRoutingEnabled()) {
+            return null;
+        }
+
+        $cleanPath = trim($path, '/');
+        if ($cleanPath === '') {
+            $cleanPath = 'index';
+        }
+
+        $isDev = DotEnv::isTruthy(DotEnv::getEnv('TINA4_DEBUG', 'false'));
+
+        if ($isDev) {
+            // Skip underscore-prefixed segments even within pages/ — they're
+            // private by Hugo/Jekyll convention (helpers, fragments) and
+            // shouldn't auto-serve.
+            foreach (explode('/', $cleanPath) as $segment) {
+                if (str_starts_with($segment, '_')) {
+                    return null;
+                }
+            }
+            $pagesDir = (self::$basePath ?: getcwd())
+                . DIRECTORY_SEPARATOR . 'src'
+                . DIRECTORY_SEPARATOR . 'templates'
+                . DIRECTORY_SEPARATOR . self::TEMPLATE_PAGES_DIR;
+            foreach (['.twig', '.html'] as $ext) {
+                if (is_file($pagesDir . DIRECTORY_SEPARATOR . $cleanPath . $ext)) {
+                    return self::TEMPLATE_PAGES_DIR . '/' . $cleanPath . $ext;
+                }
+            }
+            return null;
+        }
+
+        // Production: use cached lookup
+        if (self::$templateCache === null) {
+            self::buildTemplateCache();
+        }
+        return self::$templateCache[$cleanPath] ?? null;
+    }
+
+    /**
+     * Build the template cache by scanning src/templates/pages/ once.
+     *
+     * Only files under pages/ are eligible — partials, layouts, base.twig,
+     * errors etc remain renderable via $response->render() but never
+     * auto-serve from a URL. Files starting with _ are skipped (private).
+     *
+     * Maps URL paths to template paths relative to src/templates/
+     * (e.g. 'about' => 'pages/about.twig').
+     */
+    public static function buildTemplateCache(): void
+    {
+        self::$templateCache = [];
+        $pagesDir = (self::$basePath ?: getcwd())
+            . DIRECTORY_SEPARATOR . 'src'
+            . DIRECTORY_SEPARATOR . 'templates'
+            . DIRECTORY_SEPARATOR . self::TEMPLATE_PAGES_DIR;
+        if (!is_dir($pagesDir)) {
+            return;
+        }
+        $iterator = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($pagesDir, \RecursiveDirectoryIterator::SKIP_DOTS)
+        );
+        foreach ($iterator as $file) {
+            if (!$file->isFile()) {
+                continue;
+            }
+            $ext = $file->getExtension();
+            if ($ext !== 'twig' && $ext !== 'html') {
+                continue;
+            }
+            $relInsidePages = ltrim(str_replace($pagesDir, '', $file->getPathname()), DIRECTORY_SEPARATOR);
+            $relInsidePages = str_replace(DIRECTORY_SEPARATOR, '/', $relInsidePages);
+
+            // Skip private files even within pages/ (e.g. pages/_helper.twig)
+            $skip = false;
+            foreach (explode('/', $relInsidePages) as $segment) {
+                if (str_starts_with($segment, '_')) {
+                    $skip = true;
+                    break;
+                }
+            }
+            if ($skip) {
+                continue;
+            }
+
+            $urlPath = preg_replace('/\.(twig|html)$/', '', $relInsidePages);
+            // First match wins (.twig takes priority over .html)
+            if (!isset(self::$templateCache[$urlPath])) {
+                self::$templateCache[$urlPath] = self::TEMPLATE_PAGES_DIR . '/' . $relInsidePages;
+            }
+        }
+    }
+
+    /**
+     * Supported typed-parameter constraints. Keys are the type name written
+     * in the route pattern (e.g. ``{id:int}``); values are the regex fragment
+     * that the param must match. Mirrored verbatim in tina4-python /
+     * tina4-ruby / tina4-nodejs for cross-framework parity.
+     *
+     * Any type name not in this table raises ``InvalidArgumentException`` at
+     * route registration — we never silently fall through to the default
+     * matcher, because a typo like ``{id:inetger}`` would otherwise match
+     * anything and create a security footgun (see tina4-book#125).
+     */
+    private const PARAM_TYPE_PATTERNS = [
+        'string'  => '[^/]+',                                            // default, any non-slash segment
+        'int'     => '\d+',
+        'integer' => '\d+',
+        'float'   => '[\d.]+',
+        'number'  => '[\d.]+',
+        'alpha'   => '[A-Za-z]+',                                        // letters only
+        'alnum'   => '[A-Za-z0-9]+',                                     // letters + digits
+        'slug'    => '[a-z0-9-]+',                                       // URL slug
+        'uuid'    => '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}',
+        'path'    => '.+',                                               // greedy — matches remaining path
+        '.*'      => '.+',
+    ];
+
+    private static function compilePath(string $path): array
+    {
+        $paramNames = [];
+        $catchAll = false;
+        $catchAllName = null;
+
+        // Support bare * wildcard: /docs/* becomes a catch-all with key "*"
+        if (preg_match('#/\*$#', $path)) {
+            $path = preg_replace('#/\*$#', '/(?P<__wildcard__>.+)', $path);
+            $paramNames[] = '*';
+            $catchAll = true;
+            $catchAllName = '*';
+        }
+
+        // Replace typed and untyped params: {name}, {name:int}, {name:float}, {name:path}, {name:.*}
+        $paramTypes = [];
+        $regex = preg_replace_callback('#\{([a-zA-Z_][a-zA-Z0-9_]*)(?::([a-zA-Z.*]+))?\}#', function ($m) use (&$paramNames, &$paramTypes, &$catchAll, &$catchAllName, $path) {
+            $name = $m[1];
+            $type = $m[2] ?? 'string';
+            $paramNames[] = $name;
+            $paramTypes[$name] = $type;
+
+            if (!array_key_exists($type, self::PARAM_TYPE_PATTERNS)) {
+                $valid = array_filter(array_keys(self::PARAM_TYPE_PATTERNS), fn($k) => $k !== '.*');
+                sort($valid);
+                throw new \InvalidArgumentException(
+                    "Unknown param type '{$type}' in route '{$path}'. " .
+                    "Valid types: " . implode(', ', $valid) . "."
+                );
+            }
+
+            if ($type === 'path' || $type === '.*') {
+                $catchAll = true;
+                $catchAllName = $name;
+            }
+
+            return '(?P<' . $name . '>' . self::PARAM_TYPE_PATTERNS[$type] . ')';
+        }, $path);
+
+        // Escape forward slashes and anchor
+        $regex = '#^' . $regex . '$#';
+
+        return [
+            'regex' => $regex,
+            'paramNames' => $paramNames,
+            'paramTypes' => $paramTypes,
+            'catchAll' => $catchAll,
+            'catchAllName' => $catchAllName,
+        ];
+    }
+
+    /**
+     * Check if the last route was registered via any().
+     */
+    private function wasAnyRoute(): bool
+    {
+        if (self::$lastRouteMethod === null || self::$lastRouteIndex === null) {
+            return false;
+        }
+
+        $pattern = self::$routes[self::$lastRouteMethod][self::$lastRouteIndex]['pattern'];
+
+        // Check if the same pattern exists for all methods
+        foreach (['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] as $method) {
+            if ($this->findMatchingRoute($method, $pattern) === null) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Find the index of a route by method and pattern.
+     */
+    private function findMatchingRoute(string $method, string $pattern): ?int
+    {
+        if (!isset(self::$routes[$method])) {
+            return null;
+        }
+
+        foreach (self::$routes[$method] as $idx => $route) {
+            if ($route['pattern'] === $pattern) {
+                return $idx;
+            }
+        }
+
+        return null;
+    }
+}

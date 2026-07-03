@@ -1,0 +1,726 @@
+<?php
+
+/**
+ * Tina4 — The Intelligent Native Application 4ramework
+ * Copyright 2007 - current Tina4
+ * License: MIT https://opensource.org/licenses/MIT
+ */
+
+namespace Tina4\Database;
+
+/**
+ * Firebird database adapter — uses PHP ext-interbase (ibase or fbird functions).
+ * The extension is optional; a clear error is thrown if not installed.
+ *
+ * Firebird specifics:
+ *   - No LIMIT/OFFSET — uses FIRST/SKIP or ROWS X TO Y
+ *   - No TEXT type — uses VARCHAR(n) or BLOB SUB_TYPE TEXT
+ *   - No IF NOT EXISTS for ALTER TABLE ADD
+ *   - Uses generators for auto-increment: GEN_ID(gen_name, 1)
+ *   - RETURNING clause is supported (Firebird 2.0+)
+ */
+class FirebirdAdapter implements DatabaseAdapter
+{
+    use SqlNormalizerTrait;
+
+    /** @var resource|null */
+    private mixed $db = null;
+    /** @var resource|null Active transaction handle */
+    private mixed $transaction = null;
+    private ?string $lastError = null;
+    private bool $autoCommit;
+    private int|string $lastId = 0;
+
+    /** @var string The ibase/fbird function prefix */
+    private string $fn;
+
+    /**
+     * @param string $connectionString URL: "firebird://user:pass@host:port/path/to/db.fdb"
+     *                                  or path: "/path/to/database.fdb"
+     * @param string $username Username (default: SYSDBA)
+     * @param string $password Password (default: masterkey)
+     * @param string $charset Character set (default: UTF8)
+     * @param bool|null $autoCommit Whether to auto-commit
+     */
+    public function __construct(
+        private readonly string $connectionString,
+        private readonly string $username = 'SYSDBA',
+        private readonly string $password = 'masterkey',
+        private readonly string $charset = 'UTF8',
+        ?bool $autoCommit = null,
+    ) {
+        // Check for either ibase or fbird functions
+        if (function_exists('ibase_connect')) {
+            $this->fn = 'ibase_';
+        } elseif (function_exists('fbird_connect')) {
+            $this->fn = 'fbird_';
+        } else {
+            throw new \RuntimeException(
+                'FirebirdAdapter requires the ext-interbase PHP extension (ibase_* or fbird_* functions). '
+                . 'Install it with: sudo apt-get install php-interbase (Debian/Ubuntu) '
+                . 'or sudo pecl install interbase (other platforms).'
+            );
+        }
+
+        $envAutoCommit = \Tina4\DotEnv::getEnv('TINA4_AUTOCOMMIT');
+        $this->autoCommit = $autoCommit ?? ($envAutoCommit !== null ? filter_var($envAutoCommit, FILTER_VALIDATE_BOOLEAN) : true);
+        $this->open();
+    }
+
+    public function open(): void
+    {
+        if ($this->db !== null) {
+            return;
+        }
+
+        $params = $this->parseConnection($this->connectionString);
+        $connectFn = $this->fn . 'connect';
+
+        $dbPath = $params['database'];
+        if ($params['host'] !== '') {
+            $dbPath = $params['host'];
+            if ($params['port'] > 0 && $params['port'] !== 3050) {
+                $dbPath .= '/' . $params['port'];
+            }
+            $dbPath .= ':' . $params['database'];
+        }
+
+        $conn = @$connectFn($dbPath, $params['username'], $params['password'], $this->charset);
+        if ($conn === false) {
+            $errFn = $this->fn . 'errmsg';
+            $this->lastError = $errFn();
+            throw new \RuntimeException("FirebirdAdapter: Failed to connect: {$this->lastError}");
+        }
+
+        $this->db = $conn;
+    }
+
+    public function close(): void
+    {
+        if ($this->db !== null) {
+            $closeFn = $this->fn . 'close';
+            $closeFn($this->db);
+            $this->db = null;
+            $this->transaction = null;
+        }
+    }
+
+    public function query(string $sql, array $params = []): array
+    {
+        $this->ensureOpen();
+        $this->lastError = null;
+
+        try {
+            $result = $this->executeInternal($sql, $params);
+            if ($result === false) {
+                return [];
+            }
+
+            // For non-result queries (DDL, DML without RETURNING)
+            if ($result === true) {
+                return [];
+            }
+
+            $rows = [];
+            $fetchFn = $this->fn . 'fetch_assoc';
+            $blobInfoFn = $this->fn . 'blob_info';
+            while ($row = @$fetchFn($result, IBASE_TEXT)) {
+                // Trim string values (Firebird pads CHAR fields)
+                // and auto-decode BLOB columns
+                $cleaned = [];
+                foreach ($row as $key => $value) {
+                    if (is_resource($value)) {
+                        // BLOB resource handle — read into bytes
+                        $blobData = '';
+                        while ($chunk = fread($value, 8192)) {
+                            $blobData .= $chunk;
+                        }
+                        fclose($value);
+                        $cleaned[$key] = $blobData;
+                    } elseif (is_string($value)) {
+                        $cleaned[$key] = rtrim($value);
+                    } else {
+                        $cleaned[$key] = $value;
+                    }
+                }
+                $rows[] = $cleaned;
+            }
+
+            $freeFn = $this->fn . 'free_result';
+            @$freeFn($result);
+
+            // Auto-commit if enabled and this is a write query
+            if ($this->autoCommit && $this->isWriteQuery($sql) && $this->transaction === null) {
+                $this->commitDefault();
+            }
+
+            return $rows;
+        } catch (\Exception $e) {
+            $this->lastError = $e->getMessage();
+            return [];
+        }
+    }
+
+    public function fetch(string $sql, array $params = [], int $limit = 100, int $offset = 0): array
+    {
+        $this->ensureOpen();
+        $this->lastError = null;
+        // v3.13.12: strip trailing `;` before COUNT(*) wrap + ROWS pagination.
+        $sql = self::stripTrailingSemicolons($sql);
+
+        // v3.13.37 (DB-contract A): the MAIN paginated query must FAIL LOUD — a
+        // bad statement RAISES instead of being swallowed into an empty result
+        // set (parity with execute(), fetchOne() and the Python master). The
+        // COUNT probe is best-effort and runs on a SEPARATE statement (its own
+        // query() call), so a probe failure only defaults total to 0 and can
+        // never mask a real main-query failure.
+        $total = 0;
+        $countSql = "SELECT COUNT(*) AS total FROM ({$sql})";
+        $countResult = $this->query($countSql, $params);
+        if ($this->lastError === null) {
+            $total = (int)($countResult[0]['TOTAL'] ?? $countResult[0]['total'] ?? 0);
+        }
+
+        // Firebird pagination: ROWS X TO Y (1-based).
+        // v3.13.12: $limit <= 0 means "no pagination" (fetchAll's
+        // default — give me ALL rows).
+        $this->lastError = null;
+        if ($limit <= 0) {
+            $pagedSql = $sql;
+        } else {
+            $startRow = $offset + 1;
+            $endRow = $offset + $limit;
+            $pagedSql = "{$sql} ROWS {$startRow} TO {$endRow}";
+        }
+        $data = $this->query($pagedSql, $params);
+        // query() clears lastError on entry and records the driver error on
+        // failure (returning []), so a non-null lastError here means the MAIN
+        // query failed — RAISE it (FAILS LOUD).
+        if ($this->lastError !== null) {
+            throw new DatabaseException('Firebird fetch() failed: ' . $this->lastError);
+        }
+
+        return [
+            'data' => $data,
+            'total' => $total,
+            'limit' => $limit,
+            'offset' => $offset,
+        ];
+    }
+
+    public function fetchOne(string $sql, array $params = []): ?array
+    {
+        $sql = self::stripTrailingSemicolons($sql);
+        // FAIL LOUD (v3.13.37, DB-contract A): query() clears lastError on
+        // entry and records the driver error on failure (returning []), so a
+        // non-null lastError after the call means the statement failed — RAISE
+        // it instead of returning null (which a caller would read as "no row").
+        $rows = $this->query($sql, $params);
+        if ($this->lastError !== null) {
+            throw new DatabaseException('Firebird fetchOne() failed: ' . $this->lastError);
+        }
+        return $rows[0] ?? null;
+    }
+
+    public function execute(string $sql, array $params = []): bool|DatabaseResult
+    {
+        $this->ensureOpen();
+        $this->lastError = null;
+
+        try {
+            $result = $this->executeInternal($sql, $params);
+            if ($result === false) {
+                // FAIL LOUD: capture the cause on error() AND raise.
+                throw new DatabaseException('Firebird execute() failed: ' . ($this->lastError ?? 'unknown error'));
+            }
+
+            // If result is a resource (e.g. RETURNING), read first row for lastId
+            if ($result !== true) {
+                $fetchFn = $this->fn . 'fetch_assoc';
+                $row = @$fetchFn($result);
+                if ($row !== false && $row !== null) {
+                    $first = reset($row);
+                    if ($first !== false) {
+                        $this->lastId = is_string($first) ? trim($first) : $first;
+                    }
+                }
+                $freeFn = $this->fn . 'free_result';
+                @$freeFn($result);
+            }
+
+            if ($this->autoCommit && $this->transaction === null) {
+                $this->commitDefault();
+            }
+
+            return true;
+        } catch (DatabaseException $e) {
+            throw $e;
+        } catch (\Exception $e) {
+            $this->lastError = $e->getMessage();
+            throw $e;
+        }
+    }
+
+    public function executeMany(string $sql, array $paramsList = []): int
+    {
+        // FAIL LOUD: a failing row must NOT be silently swallowed (see the note
+        // in PostgresAdapter::executeMany). execute() raises on a bad row; let
+        // it propagate so the facade's transactional batch path can roll the
+        // whole batch back instead of committing a partial, lossy result.
+        $totalAffected = 0;
+        foreach ($paramsList as $params) {
+            $this->execute($sql, $params);
+            $totalAffected++;
+        }
+        return $totalAffected;
+    }
+
+    public function insert(string $table, array $data): bool
+    {
+        // Detect list of rows
+        if (isset($data[0]) && is_array($data[0])) {
+            $keys = array_keys($data[0]);
+            $cols = implode(', ', $keys);
+            $placeholders = implode(', ', array_fill(0, count($keys), '?'));
+            $sql = "INSERT INTO {$table} ({$cols}) VALUES ({$placeholders})";
+            $paramsList = array_map(fn($row) => array_values($row), $data);
+            return $this->executeMany($sql, $paramsList) > 0;
+        }
+
+        $cols = implode(', ', array_keys($data));
+        $placeholders = implode(', ', array_fill(0, count($data), '?'));
+        $sql = "INSERT INTO {$table} ({$cols}) VALUES ({$placeholders}) RETURNING *";
+
+        // Try with RETURNING first, fall back without if it fails
+        $result = $this->execute($sql, array_values($data));
+        if ($result) {
+            return true;
+        }
+
+        // Fallback without RETURNING
+        $sql = "INSERT INTO {$table} ({$cols}) VALUES ({$placeholders})";
+        return $this->execute($sql, array_values($data));
+    }
+
+    public function update(string $table, array $data, string $where = '', array $whereParams = []): bool
+    {
+        $setParts = [];
+        $params = [];
+        foreach ($data as $col => $val) {
+            $setParts[] = "{$col} = ?";
+            $params[] = $val;
+        }
+        $sql = "UPDATE {$table} SET " . implode(', ', $setParts);
+        if ($where !== '') {
+            $sql .= " WHERE {$where}";
+            $params = array_merge($params, $whereParams);
+        }
+        return $this->execute($sql, $params);
+    }
+
+    public function delete(string $table, string|array $filter = '', array $whereParams = []): bool
+    {
+        if (is_array($filter) && isset($filter[0]) && is_array($filter[0])) {
+            foreach ($filter as $row) {
+                if (!$this->delete($table, $row)) return false;
+            }
+            return true;
+        }
+        if (is_array($filter)) {
+            $parts = [];
+            $params = [];
+            foreach ($filter as $col => $val) {
+                $parts[] = "{$col} = ?";
+                $params[] = $val;
+            }
+            return $this->delete($table, implode(' AND ', $parts), $params);
+        }
+        $sql = "DELETE FROM {$table}";
+        if ($filter !== '') {
+            $sql .= " WHERE {$filter}";
+        }
+        return $this->execute($sql, $whereParams);
+    }
+
+    public function tableExists(string $table): bool
+    {
+        $rows = $this->query(
+            "SELECT RDB\$RELATION_NAME FROM RDB\$RELATIONS WHERE RDB\$SYSTEM_FLAG = 0 AND RDB\$VIEW_BLR IS NULL AND TRIM(RDB\$RELATION_NAME) = ?",
+            [strtoupper($table)]
+        );
+        return count($rows) > 0;
+    }
+
+    public function getColumns(string $table): array
+    {
+        $sql = "SELECT RF.RDB\$FIELD_NAME AS field_name,
+                       F.RDB\$FIELD_TYPE AS field_type,
+                       RF.RDB\$NULL_FLAG AS null_flag,
+                       RF.RDB\$DEFAULT_SOURCE AS default_source
+                FROM RDB\$RELATION_FIELDS RF
+                JOIN RDB\$FIELDS F ON RF.RDB\$FIELD_SOURCE = F.RDB\$FIELD_NAME
+                WHERE RF.RDB\$RELATION_NAME = ?
+                ORDER BY RF.RDB\$FIELD_POSITION";
+
+        $rows = $this->query($sql, [strtoupper($table)]);
+        $columns = [];
+
+        // Firebird field type codes
+        $typeMap = [
+            7 => 'SMALLINT', 8 => 'INTEGER', 10 => 'FLOAT', 12 => 'DATE',
+            13 => 'TIME', 14 => 'CHAR', 16 => 'BIGINT', 27 => 'DOUBLE PRECISION',
+            35 => 'TIMESTAMP', 37 => 'VARCHAR', 261 => 'BLOB',
+        ];
+
+        // Get primary key columns
+        $pkRows = $this->query(
+            "SELECT TRIM(ISG.RDB\$FIELD_NAME) AS pk_field
+             FROM RDB\$RELATION_CONSTRAINTS RC
+             JOIN RDB\$INDEX_SEGMENTS ISG ON RC.RDB\$INDEX_NAME = ISG.RDB\$INDEX_NAME
+             WHERE RC.RDB\$CONSTRAINT_TYPE = 'PRIMARY KEY' AND RC.RDB\$RELATION_NAME = ?",
+            [strtoupper($table)]
+        );
+        $pkFields = array_column($pkRows, 'PK_FIELD');
+        // Trim all PK field names
+        $pkFields = array_map('trim', $pkFields);
+
+        foreach ($rows as $row) {
+            $fieldName = trim($row['FIELD_NAME'] ?? $row['field_name'] ?? '');
+            $fieldType = (int)($row['FIELD_TYPE'] ?? $row['field_type'] ?? 0);
+
+            $columns[] = [
+                'name' => $fieldName,
+                'type' => $typeMap[$fieldType] ?? "TYPE_{$fieldType}",
+                'nullable' => ($row['NULL_FLAG'] ?? $row['null_flag'] ?? null) === null,
+                'default' => $row['DEFAULT_SOURCE'] ?? $row['default_source'] ?? null,
+                'primary' => in_array($fieldName, $pkFields, true),
+            ];
+        }
+
+        return $columns;
+    }
+
+    public function getTables(): array
+    {
+        $rows = $this->query(
+            "SELECT TRIM(RDB\$RELATION_NAME) AS table_name FROM RDB\$RELATIONS WHERE RDB\$SYSTEM_FLAG = 0 AND RDB\$VIEW_BLR IS NULL ORDER BY RDB\$RELATION_NAME"
+        );
+
+        return array_map(
+            fn($row) => trim($row['TABLE_NAME'] ?? $row['table_name'] ?? ''),
+            $rows
+        );
+    }
+
+    public function lastInsertId(): int|string
+    {
+        return $this->lastId;
+    }
+
+    public function startTransaction(): void
+    {
+        $this->ensureOpen();
+        $transFn = $this->fn . 'trans';
+        $this->transaction = $transFn(IBASE_DEFAULT, $this->db);
+    }
+
+    public function commit(): void
+    {
+        $this->ensureOpen();
+        if ($this->transaction !== null) {
+            $commitFn = $this->fn . 'commit';
+            $commitFn($this->transaction);
+            $this->transaction = null;
+        } else {
+            $this->commitDefault();
+        }
+    }
+
+    public function rollback(): void
+    {
+        $this->ensureOpen();
+        try {
+            if ($this->transaction !== null) {
+                $rollbackFn = $this->fn . 'rollback';
+                $rollbackFn($this->transaction);
+                $this->transaction = null;
+            }
+        } catch (\Exception $e) {
+            $this->lastError = $e->getMessage();
+        }
+    }
+
+    public function error(): ?string
+    {
+        return $this->lastError;
+    }
+
+    /**
+     * Get the underlying ibase/fbird connection resource.
+     */
+    public function getConnection(): mixed
+    {
+        return $this->db;
+    }
+
+    /**
+     * Get the connection string.
+     */
+    public function getDatabase(): string
+    {
+        return $this->connectionString;
+    }
+
+    // ── Private helpers ──────────────────────────────────────────────
+
+    private function ensureOpen(): void
+    {
+        if ($this->db === null) {
+            $this->open();
+        }
+    }
+
+    /**
+     * Parse a connection string (URL or path) into connection params.
+     *
+     * Database identifier resolution — two layers:
+     *
+     * 1. ``TINA4_DATABASE_FIREBIRD_PATH`` env override wins if set. Useful
+     *    for Windows users with raw backslash paths (no URL encoding
+     *    required) and for ops setups that keep server URL and DB
+     *    location in separate config layers.
+     * 2. Otherwise normalise the URL path component via
+     *    {@see normalizeDbIdentifier()} — accepts every sensible variant
+     *    (single/double slash, drive letter, alias).
+     */
+    private function parseConnection(string $input): array
+    {
+        $envOverride = \Tina4\DotEnv::getEnv('TINA4_DATABASE_FIREBIRD_PATH');
+
+        if (str_contains($input, '://')) {
+            $parts = parse_url($input);
+            $rawPath = $parts['path'] ?? '';
+            $database = ($envOverride !== null && $envOverride !== '')
+                ? $envOverride
+                : self::normalizeDbIdentifier($rawPath);
+            return [
+                'host' => $parts['host'] ?? '',
+                'port' => $parts['port'] ?? 3050,
+                'username' => isset($parts['user']) ? urldecode($parts['user']) : $this->username,
+                'password' => isset($parts['pass']) ? urldecode($parts['pass']) : $this->password,
+                'database' => $database,
+            ];
+        }
+
+        // Plain file path — env override still wins if set.
+        return [
+            'host' => '',
+            'port' => 3050,
+            'username' => $this->username,
+            'password' => $this->password,
+            'database' => ($envOverride !== null && $envOverride !== '') ? $envOverride : $input,
+        ];
+    }
+
+    /**
+     * Turn the URL path component into a Firebird database identifier.
+     *
+     * Firebird is the awkward one — it needs either an absolute file path
+     * on the server, a Windows drive-letter path, or an alias name. The
+     * classic URI form uses a double-slash to keep the leading "/" of an
+     * absolute path through ``parse_url``::
+     *
+     *     firebird://host:port//firebird/data/app.fdb   →  /firebird/data/app.fdb
+     *
+     * But that double slash is unintuitive to anyone used to the way
+     * postgres / mysql / mssql encode the database name. We accept five
+     * equivalent forms and normalise all of them:
+     *
+     * - ``//abs/path/db.fdb``  → ``/abs/path/db.fdb``  (classic double-slash)
+     * - ``/abs/path/db.fdb``   → ``/abs/path/db.fdb``  (single-slash, what most people type)
+     * - ``/C:/Data/db.fdb``    → ``C:/Data/db.fdb``    (Windows, leading URL slash dropped)
+     * - ``/C%3A/Data/db.fdb``  → ``C:/Data/db.fdb``    (Windows with URL-encoded colon)
+     * - ``/employee``          → ``employee``          (alias — single token)
+     *
+     * Aliases are detected as the leftover case: a single token with no
+     * slashes. Anything path-like is kept as a path.
+     */
+    public static function normalizeDbIdentifier(string $rawPath): string
+    {
+        $decoded = urldecode($rawPath);
+
+        // Classic double-slash form: //abs/path → /abs/path
+        if (str_starts_with($decoded, '//')) {
+            $decoded = substr($decoded, 1);
+        }
+
+        // Windows drive-letter — drop the URL-introduced leading slash.
+        // /C:/Data/db.fdb → C:/Data/db.fdb
+        if (preg_match('#^/?[A-Za-z]:[/\\\\]#', $decoded)) {
+            if (str_starts_with($decoded, '/')) {
+                $decoded = substr($decoded, 1);
+            }
+            return $decoded;
+        }
+
+        // Look at the content after stripping the leading slash. If it's
+        // a single token with no separators, it's a Firebird alias —
+        // return WITHOUT the leading slash (the alias name itself is the
+        // identifier).
+        $body = str_starts_with($decoded, '/') ? substr($decoded, 1) : $decoded;
+        if ($body !== '' && !str_contains($body, '/') && !str_contains($body, '\\')) {
+            return $body;
+        }
+
+        // Otherwise it's a file path. If it already has a leading slash,
+        // keep it. If it's a relative-looking path (slash-separated but
+        // no leading "/") promote it to absolute — Firebird needs
+        // absolute paths and we don't know the server's CWD anyway.
+        return str_starts_with($decoded, '/') ? $decoded : '/' . $decoded;
+    }
+
+    /**
+     * Execute a SQL statement with params using ibase_prepare/ibase_execute.
+     *
+     * Wraps the underlying ibase calls in a one-shot reconnect-and-retry on
+     * dead-connection errors ("Error writing data to the connection",
+     * connection shutdown, network error). Idle Firebird connections die
+     * silently behind NAT timeouts, server-side ConnectionIdleTimeout, or
+     * Docker network rotation; without this the next prepare() crashes the
+     * request. Skipped inside an explicit transaction — atomicity beats
+     * resilience there; the caller handles rollback.
+     *
+     * @return resource|bool Result resource or true for non-SELECT, false on error
+     */
+    private function executeInternal(string $sql, array $params): mixed
+    {
+        try {
+            return $this->doExecute($sql, $params);
+        } catch (\Throwable $e) {
+            if (!self::isDeadConnection($e->getMessage()) || $this->transaction !== null) {
+                throw $e;
+            }
+            $this->reconnect();
+            return $this->doExecute($sql, $params);
+        }
+    }
+
+    /**
+     * Raw single-attempt execute. Throws on dead-connection so executeInternal
+     * can decide whether to retry; returns the result resource (or true/false)
+     * for ordinary outcomes.
+     *
+     * @return resource|bool
+     */
+    private function doExecute(string $sql, array $params): mixed
+    {
+        $errFn = $this->fn . 'errmsg';
+        $context = $this->transaction ?? $this->db;
+
+        if (empty($params)) {
+            $queryFn = $this->fn . 'query';
+            $result = @$queryFn($context, $sql);
+        } else {
+            // ibase/fbird only speaks ? — translate :named from the ORM/QueryBuilder.
+            [$sql, $params] = \Tina4\SqlTranslation::namedToPositional($sql, $params);
+
+            $prepareFn = $this->fn . 'prepare';
+            $executeFn = $this->fn . 'execute';
+
+            $stmt = @$prepareFn($context, $sql);
+            if ($stmt === false) {
+                $msg = $errFn();
+                if (self::isDeadConnection($msg)) {
+                    throw new \RuntimeException($msg);
+                }
+                $this->lastError = $msg;
+                return false;
+            }
+
+            // Firebird has no native boolean — a BooleanField column is INTEGER,
+            // so bind PHP booleans as 1/0 (ibase otherwise stringifies `false`
+            // to '' — same class of bug as PG).
+            $values = self::normalizeBoolParams(array_values($params), nativeBoolean: false);
+            $result = @$executeFn($stmt, ...$values);
+        }
+
+        if ($result === false) {
+            $msg = $errFn();
+            if (self::isDeadConnection($msg)) {
+                throw new \RuntimeException($msg);
+            }
+            $this->lastError = $msg;
+            return false;
+        }
+
+        return $result;
+    }
+
+    /**
+     * Detect dead-socket Firebird errors that warrant a reconnect.
+     * Substring match (case-insensitive) so we match both ibase and fbird
+     * wording, and across server-side versus driver-side error sources.
+     */
+    public static function isDeadConnection(?string $msg): bool
+    {
+        if ($msg === null || $msg === '') {
+            return false;
+        }
+        $lower = strtolower($msg);
+        $markers = [
+            'error writing data to the connection',
+            'error reading data from the connection',
+            'connection shutdown',
+            'connection lost',
+            'network error',
+            'connection is not active',
+            'broken pipe',
+        ];
+        foreach ($markers as $m) {
+            if (str_contains($lower, $m)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Force-close any stale handle and reopen using the original connection
+     * params. Idempotent — safe to call when the connection is already dead.
+     */
+    private function reconnect(): void
+    {
+        if ($this->db !== null) {
+            try {
+                $closeFn = $this->fn . 'close';
+                @$closeFn($this->db);
+            } catch (\Throwable) {
+                // ignored — connection already gone
+            }
+        }
+        $this->db = null;
+        $this->transaction = null;
+        $this->open();
+    }
+
+    /**
+     * Commit the default transaction (used for auto-commit).
+     */
+    private function commitDefault(): void
+    {
+        $commitFn = $this->fn . 'commit_ret';
+        if (function_exists($commitFn)) {
+            @$commitFn($this->db);
+        }
+    }
+
+    /**
+     * Check if a SQL query is a write operation.
+     */
+    private function isWriteQuery(string $sql): bool
+    {
+        $sql = ltrim($sql);
+        $firstWord = strtoupper(strtok($sql, " \t\n\r"));
+        return in_array($firstWord, ['INSERT', 'UPDATE', 'DELETE', 'REPLACE'], true);
+    }
+}

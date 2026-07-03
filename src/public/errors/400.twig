@@ -1,0 +1,9 @@
+{% extends "errors/base.twig" %}
+{% block title %}400 — Bad Request{% endblock %}
+{% block content %}
+    <div class="error-code" style="color:var(--danger)">400</div>
+    <div class="error-title">Bad Request</div>
+    <div class="error-msg">Something went wrong with your request.</div>
+    <div class="error-path" style="color:var(--danger)">{{ server.REQUEST_URI }}</div>
+    <a href="/" class="error-home">Go Home</a>
+{% endblock %}

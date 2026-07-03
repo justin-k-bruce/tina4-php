@@ -1,0 +1,1278 @@
+<?php
+
+/**
+ * Tina4 — The Intelligent Native Application 4ramework
+ * Copyright 2007 - current Tina4
+ * License: MIT https://opensource.org/licenses/MIT
+ *
+ * GraphQL — Zero-dependency GraphQL engine.
+ * Recursive-descent parser, schema builder, and query executor.
+ * Matches the Python tina4_python.graphql implementation.
+ */
+
+namespace Tina4;
+
+class GraphQL
+{
+    /** @var array<string, array> Registered types: name => [field => type] */
+    private array $types = [];
+
+    /** @var array<string, array> Registered queries: name => [args, returnType, resolver] */
+    private array $queries = [];
+
+    /** @var array<string, array> Registered mutations: name => [args, returnType, resolver] */
+    private array $mutations = [];
+
+    /** @var array<string, array<string, callable>> Field resolvers for object types. */
+    private array $fieldResolvers = [];
+
+    /**
+     * Class-level resolver registry — populated by GraphQL::resolve()
+     * BEFORE any GraphQL instance is constructed. When __construct() runs,
+     * the instance drains the registry into its schema. This is what
+     * makes the documented decorator-style pattern work at import time:
+     * modules register via static `GraphQL::resolve("Query", "users", $fn)`
+     * before the singleton is even created.
+     *
+     * Structure: [type][field] => callable
+     * type is "Query", "Mutation", or any object type name.
+     *
+     * @var array<string, array<string, callable>>
+     */
+    private static array $classResolvers = [];
+
+    /** The "default" instance set via GraphQL::setDefault() — receives post-startup resolve() calls. */
+    private static ?self $defaultInstance = null;
+
+    /**
+     * Maximum selection-set nesting depth. A deeply nested query (or a circular
+     * fragment) would otherwise recurse without bound — a classic GraphQL DoS /
+     * stack-overflow vector. Counted per selection level AND per fragment spread,
+     * so circular fragments are caught too. The default (50) is far beyond any
+     * legitimate query; set TINA4_GRAPHQL_MAX_DEPTH <= 0 to disable the guard.
+     */
+    public int $maxDepth = 50;
+
+    public function __construct()
+    {
+        $envDepth = DotEnv::getEnv('TINA4_GRAPHQL_MAX_DEPTH', '50');
+        $this->maxDepth = is_numeric($envDepth) ? (int) $envDepth : 50;
+
+        // Drain any resolvers registered via the class-level GraphQL::resolve()
+        // BEFORE this instance was constructed.
+        foreach (self::$classResolvers as $typeName => $fields) {
+            foreach ($fields as $fieldName => $resolver) {
+                $this->attachResolver($typeName, $fieldName, $resolver);
+            }
+        }
+    }
+
+    /**
+     * Decorator-style resolver registration — matches the cross-framework
+     * @GraphQL.resolve() pattern shipped in Python tina4_python 3.13.0.
+     *
+     *     GraphQL::resolve("Query", "products", function ($root, $args) {
+     *         return (new Product())->select();
+     *     });
+     *
+     *     GraphQL::resolve("Mutation", "createProduct", function ($root, $args) {
+     *         $p = new Product($args["input"]);
+     *         return $p->save()->toArray();
+     *     });
+     *
+     *     GraphQL::resolve("Product", "reviews", function ($product, $args) {
+     *         return (new Review())->where("product_id = ?", [$product["id"]]);
+     *     });
+     *
+     * Resolvers registered before any GraphQL instance exists accumulate
+     * in a class-level registry; new GraphQL() drains them into its
+     * schema. Resolvers registered AFTER an instance is set as default
+     * (via setDefault) are wired in immediately.
+     *
+     * @param string   $typeName  "Query", "Mutation", or an object type name
+     * @param string   $fieldName Field name within the type
+     * @param callable $resolver  function($root, $args, $context = []) — returns the field value
+     */
+    public static function resolve(string $typeName, string $fieldName, callable $resolver): void
+    {
+        self::$classResolvers[$typeName] ??= [];
+        self::$classResolvers[$typeName][$fieldName] = $resolver;
+
+        // If a default instance is active, attach immediately so post-startup
+        // registrations take effect without re-instantiation.
+        if (self::$defaultInstance !== null) {
+            self::$defaultInstance->attachResolver($typeName, $fieldName, $resolver);
+        }
+    }
+
+    /**
+     * Designate `$instance` as the default singleton. Post-startup
+     * GraphQL::resolve() calls wire into this instance's live schema.
+     */
+    public static function setDefault(self $instance): void
+    {
+        self::$defaultInstance = $instance;
+    }
+
+    /**
+     * Wire a single resolver into the live schema.
+     *
+     * For Query/Mutation, lands in $this->queries / $this->mutations.
+     * For object types, stored in $this->fieldResolvers so the executor
+     * can dispatch during nested field resolution.
+     */
+    private function attachResolver(string $typeName, string $fieldName, callable $resolver): void
+    {
+        if ($typeName === 'Query') {
+            $existing = $this->queries[$fieldName] ?? [];
+            $existing['resolve'] = $resolver;
+            $existing['args'] ??= [];
+            $existing['type'] ??= 'String';
+            $this->queries[$fieldName] = $existing;
+            return;
+        }
+        if ($typeName === 'Mutation') {
+            $existing = $this->mutations[$fieldName] ?? [];
+            $existing['resolve'] = $resolver;
+            $existing['args'] ??= [];
+            $existing['type'] ??= 'String';
+            $this->mutations[$fieldName] = $existing;
+            return;
+        }
+        // Object-type field resolver — stash for the executor to consult
+        $this->fieldResolvers[$typeName] ??= [];
+        $this->fieldResolvers[$typeName][$fieldName] = $resolver;
+    }
+
+    /**
+     * Get the field resolver registered for an object type, if any.
+     * Used by the executor during nested field resolution.
+     */
+    public function getFieldResolver(string $typeName, string $fieldName): ?callable
+    {
+        return $this->fieldResolvers[$typeName][$fieldName] ?? null;
+    }
+
+    /**
+     * Test-only — clear the class-level resolver registry. Used by parity
+     * tests to avoid bleed-over between cases.
+     */
+    public static function _clearClassResolvers(): void
+    {
+        self::$classResolvers = [];
+        self::$defaultInstance = null;
+    }
+
+    /**
+     * Register an HTTP endpoint that executes incoming GraphQL queries against
+     * this instance. Path defaults to TINA4_GRAPHQL_ENDPOINT (default
+     * "/graphql"). Idempotent at the env level — call once after schema setup.
+     *
+     * Body shape: {"query": "...", "variables": {...}, "operationName": "..."}
+     */
+    public function register(?string $endpoint = null): void
+    {
+        if ($endpoint === null || $endpoint === '') {
+            $envPath = DotEnv::getEnv('TINA4_GRAPHQL_ENDPOINT');
+            $endpoint = ($envPath !== null && $envPath !== '') ? $envPath : '/graphql';
+        }
+        if (!str_starts_with($endpoint, '/')) {
+            $endpoint = '/' . $endpoint;
+        }
+
+        $self = $this;
+        Router::post($endpoint, function (Request $request, Response $response) use ($self) {
+            $body = $request->body;
+            if (is_string($body)) {
+                $decoded = json_decode($body, true);
+                $body = is_array($decoded) ? $decoded : [];
+            } elseif (!is_array($body)) {
+                $body = [];
+            }
+            $query = (string) ($body['query'] ?? '');
+            $vars = is_array($body['variables'] ?? null) ? $body['variables'] : null;
+            $result = $self->execute($query, $vars);
+            return $response->json($result);
+        })->noAuth();
+    }
+
+    /**
+     * Resolved GraphQL endpoint URL based on TINA4_GRAPHQL_ENDPOINT.
+     * Useful for tests and dev tooling.
+     */
+    public static function resolvedEndpoint(): string
+    {
+        $envPath = DotEnv::getEnv('TINA4_GRAPHQL_ENDPOINT');
+        $endpoint = ($envPath !== null && $envPath !== '') ? $envPath : '/graphql';
+        if (!str_starts_with($endpoint, '/')) {
+            $endpoint = '/' . $endpoint;
+        }
+        return $endpoint;
+    }
+
+    /**
+     * Register a type definition.
+     *
+     * @param string $name   Type name
+     * @param array  $fields Field definitions: [fieldName => typeName]
+     * @return self
+     */
+    public function addType(string $name, array $fields): self
+    {
+        $this->types[$name] = $fields;
+        return $this;
+    }
+
+    /**
+     * Register a query resolver.
+     *
+     * @param string   $name       Query name
+     * @param array    $args       Argument definitions: [argName => typeName]
+     * @param string   $returnType Return type name
+     * @param callable $resolver   Resolver function(root, args, context)
+     * @return self
+     */
+    public function addQuery(string $name, array $args, string $returnType, callable $resolver): self
+    {
+        $this->queries[$name] = [
+            'args' => $args,
+            'type' => $returnType,
+            'resolve' => $resolver,
+        ];
+        return $this;
+    }
+
+    /**
+     * Register a mutation resolver.
+     *
+     * @param string   $name       Mutation name
+     * @param array    $args       Argument definitions: [argName => typeName]
+     * @param string   $returnType Return type name
+     * @param callable $resolver   Resolver function(root, args, context)
+     * @return self
+     */
+    public function addMutation(string $name, array $args, string $returnType, callable $resolver): self
+    {
+        $this->mutations[$name] = [
+            'args' => $args,
+            'type' => $returnType,
+            'resolve' => $resolver,
+        ];
+        return $this;
+    }
+
+    /**
+     * Execute a GraphQL query string.
+     *
+     * @param string     $query     GraphQL query/mutation string
+     * @param array|null $variables Variable values
+     * @param array      $context   Execution context (auth, request, etc.)
+     * @return array {data: mixed, errors?: array}
+     */
+    public function execute(string $query, ?array $variables = null, array $context = []): array
+    {
+        $variables = $variables ?? [];
+        $errors = [];
+
+        try {
+            $tokens = $this->tokenize($query);
+            $parser = new GraphQLParser($tokens);
+            $doc = $parser->parse();
+        } catch (\Throwable $e) {
+            return ['data' => null, 'errors' => [['message' => $e->getMessage()]]];
+        }
+
+        // Separate fragments and operations
+        $fragments = [];
+        $operations = [];
+        foreach ($doc['definitions'] as $defn) {
+            if ($defn['kind'] === 'fragment') {
+                $fragments[$defn['name']] = $defn;
+            } else {
+                $operations[] = $defn;
+            }
+        }
+
+        if (empty($operations)) {
+            return ['data' => null, 'errors' => [['message' => 'No operation found']]];
+        }
+
+        $op = $operations[0];
+        $resolvers = ($op['operation'] === 'query') ? $this->queries : $this->mutations;
+
+        // Apply variable defaults
+        foreach ($op['variables'] ?? [] as $vdef) {
+            if (!isset($variables[$vdef['name']]) && $vdef['default'] !== null) {
+                $variables[$vdef['name']] = $vdef['default'];
+            }
+        }
+
+        $data = [];
+        $errs = $this->resolveSelectionsInto($op['selections'], $resolvers, null, $variables, $fragments, $data, $context, 1);
+        $errors = array_merge($errors, $errs);
+
+        $response = ['data' => $data];
+        if (!empty($errors)) {
+            $response['errors'] = $errors;
+        }
+        return $response;
+    }
+
+    /**
+     * Return the schema as SDL string.
+     *
+     * @return string
+     */
+    public function schemaSdl(): string
+    {
+        $sdl = '';
+
+        foreach ($this->types as $name => $fields) {
+            $sdl .= "type {$name} {\n";
+            foreach ($fields as $field => $type) {
+                $sdl .= "  {$field}: {$type}\n";
+            }
+            $sdl .= "}\n\n";
+        }
+
+        if (!empty($this->queries)) {
+            $sdl .= "type Query {\n";
+            foreach ($this->queries as $name => $config) {
+                $argStr = $this->formatArgs($config['args']);
+                $sdl .= "  {$name}{$argStr}: {$config['type']}\n";
+            }
+            $sdl .= "}\n\n";
+        }
+
+        if (!empty($this->mutations)) {
+            $sdl .= "type Mutation {\n";
+            foreach ($this->mutations as $name => $config) {
+                $argStr = $this->formatArgs($config['args']);
+                $sdl .= "  {$name}{$argStr}: {$config['type']}\n";
+            }
+            $sdl .= "}\n\n";
+        }
+
+        return $sdl;
+    }
+
+    /**
+     * Return schema metadata for debugging.
+     */
+    public function introspect(): array
+    {
+        $queries = [];
+        foreach ($this->queries as $name => $config) {
+            $queries[$name] = ['type' => $config['type'], 'args' => $config['args'] ?? []];
+        }
+        $mutations = [];
+        foreach ($this->mutations as $name => $config) {
+            $mutations[$name] = ['type' => $config['type'], 'args' => $config['args'] ?? []];
+        }
+        return ['types' => $this->types, 'queries' => $queries, 'mutations' => $mutations];
+    }
+
+    /**
+     * Get registered types.
+     */
+    public function getTypes(): array
+    {
+        return $this->types;
+    }
+
+    /**
+     * Get registered queries.
+     */
+    public function getQueries(): array
+    {
+        return $this->queries;
+    }
+
+    /**
+     * Get registered mutations.
+     */
+    public function getMutations(): array
+    {
+        return $this->mutations;
+    }
+
+    // ── Tokenizer ────────────────────────────────────────────────
+
+    /**
+     * Tokenize a GraphQL query string.
+     *
+     * @param string $source
+     * @return array List of [type, value, pos]
+     */
+    public function tokenize(string $source): array
+    {
+        $patterns = [
+            'SPREAD'   => '\.\.\.',
+            'LBRACE'   => '\{',
+            'RBRACE'   => '\}',
+            'LPAREN'   => '\(',
+            'RPAREN'   => '\)',
+            'LBRACKET' => '\[',
+            'RBRACKET' => '\]',
+            'COLON'    => ':',
+            'BANG'     => '!',
+            'EQUALS'   => '=',
+            'AT'       => '@',
+            'DOLLAR'   => '\$',
+            'COMMA'    => ',',
+            'STRING'   => '"(?:[^"\\\\]|\\\\.)*"',
+            'NUMBER'   => '-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?',
+            'BOOL'     => '\b(?:true|false)\b',
+            'NULL_VAL' => '\bnull\b',
+            'NAME'     => '[_a-zA-Z]\w*',
+            'SKIP'     => '[\s,]+',
+            'COMMENT'  => '#[^\n]*',
+        ];
+
+        $combined = '';
+        foreach ($patterns as $name => $pattern) {
+            if ($combined !== '') {
+                $combined .= '|';
+            }
+            $combined .= "(?P<{$name}>{$pattern})";
+        }
+
+        $tokens = [];
+        if (preg_match_all("/{$combined}/", $source, $matches, PREG_SET_ORDER | PREG_OFFSET_CAPTURE)) {
+            foreach ($matches as $match) {
+                foreach ($patterns as $name => $_) {
+                    if (isset($match[$name]) && $match[$name][1] !== -1 && $match[$name][0] !== '') {
+                        if ($name === 'SKIP' || $name === 'COMMENT') {
+                            break;
+                        }
+                        // Normalize NULL_VAL to NULL for parser
+                        $type = ($name === 'NULL_VAL') ? 'NULL' : $name;
+                        $tokens[] = ['type' => $type, 'value' => $match[$name][0], 'pos' => $match[$name][1]];
+                        break;
+                    }
+                }
+            }
+        }
+
+        return $tokens;
+    }
+
+    // ── Resolver engine ─────────────────────────────────────────
+
+    /**
+     * Resolve selections and merge results into target.
+     *
+     * Fragment spreads and inline fragments are merged (not nested).
+     *
+     * $depth is incremented on every recursive entry (field sub-selections,
+     * fragment spreads, inline fragments) and checked against $maxDepth so an
+     * over-deep query or a circular fragment fails with a structured error
+     * instead of recursing until the interpreter stack overflows.
+     */
+    private function resolveSelectionsInto(array $selections, array $resolvers, mixed $parent,
+                                           array $variables, array $fragments, array &$target,
+                                           array $context = [], int $depth = 1): array
+    {
+        $errors = [];
+        if ($this->maxDepth > 0 && $depth > $this->maxDepth) {
+            return [['message' => "Query exceeds maximum depth of {$this->maxDepth}"]];
+        }
+
+        foreach ($selections as $sel) {
+            if (!$this->checkDirectives($sel['directives'] ?? [], $variables, $context)) {
+                continue;
+            }
+
+            if ($sel['kind'] === 'fragment_spread') {
+                $frag = $fragments[$sel['name']] ?? null;
+                if (!$frag) {
+                    $errors[] = ['message' => "Fragment not found: {$sel['name']}"];
+                    continue;
+                }
+                $errs = $this->resolveSelectionsInto(
+                    $frag['selections'], $resolvers, $parent, $variables, $fragments, $target, $context, $depth + 1
+                );
+                $errors = array_merge($errors, $errs);
+                continue;
+            }
+
+            if ($sel['kind'] === 'inline_fragment') {
+                $errs = $this->resolveSelectionsInto(
+                    $sel['selections'], $resolvers, $parent, $variables, $fragments, $target, $context, $depth + 1
+                );
+                $errors = array_merge($errors, $errs);
+                continue;
+            }
+
+            // Field resolution
+            [$val, $errs] = $this->resolveField($sel, $resolvers, $parent, $variables, $fragments, $context, $depth);
+            $errors = array_merge($errors, $errs);
+            $key = $sel['alias'] ?? $sel['name'];
+            $target[$key] = $val;
+        }
+
+        return $errors;
+    }
+
+    /**
+     * Resolve a single field.
+     */
+    private function resolveField(array $sel, array $resolvers, mixed $parent,
+                                  array $variables, array $fragments, array $context = [], int $depth = 1): array
+    {
+        $errors = [];
+        $name = $sel['name'];
+        $args = $this->resolveArgs($sel['args'] ?? [], $variables);
+
+        $value = null;
+        if ($parent !== null) {
+            if (is_array($parent)) {
+                $value = $parent[$name] ?? null;
+            } elseif (is_object($parent)) {
+                $value = $parent->$name ?? null;
+            }
+        } elseif (isset($resolvers[$name])) {
+            $config = $resolvers[$name];
+
+            // Input validation — check args against declared types
+            $validationErrors = $this->validateArgs($args, $config['args'] ?? [], $name);
+            if (!empty($validationErrors)) {
+                return [null, $validationErrors];
+            }
+
+            $resolver = $config['resolve'] ?? null;
+            if ($resolver) {
+                // Inject sub-selections into context for DataLoader/eager-loading
+                $ctx = $context;
+                $ctx['__selections'] = $sel['selections'] ?? [];
+                try {
+                    $value = $resolver(null, $args, $ctx);
+                } catch (\Throwable $e) {
+                    // Log the real cause; only surface the detail to the client
+                    // in debug mode — a resolver exception can carry internal
+                    // state (DB errors, credentials) that must not leak.
+                    Log::error("GraphQL resolver '{$name}' failed: " . $e->getMessage());
+                    $detail = ErrorOverlay::isDebugMode() ? $e->getMessage() : 'Internal server error';
+                    $errors[] = ['message' => $detail, 'path' => [$name]];
+                    return [null, $errors];
+                }
+            }
+        }
+
+        if (empty($sel['selections'])) {
+            return [$value, $errors];
+        }
+
+        if (is_array($value) && !$this->isAssoc($value)) {
+            $result = [];
+            foreach ($value as $item) {
+                $obj = [];
+                $errs = $this->resolveSelectionsInto(
+                    $sel['selections'], [], $item, $variables, $fragments, $obj, $context, $depth + 1
+                );
+                $errors = array_merge($errors, $errs);
+                $result[] = $obj;
+            }
+            return [$result, $errors];
+        }
+
+        if ($value !== null) {
+            $obj = [];
+            $errs = $this->resolveSelectionsInto(
+                $sel['selections'], [], $value, $variables, $fragments, $obj, $context, $depth + 1
+            );
+            $errors = array_merge($errors, $errs);
+            return [$obj, $errors];
+        }
+
+        return [null, $errors];
+    }
+
+    /**
+     * Resolve argument values, substituting variables.
+     */
+    private function resolveArgs(array $args, array $variables): array
+    {
+        $resolved = [];
+        foreach ($args as $k => $v) {
+            if (is_array($v) && isset($v['$var'])) {
+                $resolved[$k] = $variables[$v['$var']] ?? null;
+            } elseif (is_array($v) && !$this->isAssoc($v)) {
+                $resolved[$k] = array_map(function ($i) use ($variables) {
+                    if (is_array($i) && isset($i['$var'])) {
+                        return $variables[$i['$var']] ?? null;
+                    }
+                    return $i;
+                }, $v);
+            } else {
+                $resolved[$k] = $v;
+            }
+        }
+        return $resolved;
+    }
+
+    /**
+     * Check directives: @skip, @include, @auth, @role, @guest.
+     *
+     * Returns true if the field should be included, false to skip.
+     */
+    private function checkDirectives(array $directives, array $variables, array $context = []): bool
+    {
+        foreach ($directives as $d) {
+            $val = $d['args']['if'] ?? false;
+            if (is_array($val) && isset($val['$var'])) {
+                $val = $variables[$val['$var']] ?? false;
+            }
+
+            // Built-in: @skip and @include
+            if ($d['name'] === 'skip' && $val) {
+                return false;
+            }
+            if ($d['name'] === 'include' && !$val) {
+                return false;
+            }
+
+            // Auth: @auth — requires any authenticated user
+            if ($d['name'] === 'auth') {
+                if (empty($context['user'])) {
+                    return false;
+                }
+            }
+
+            // Auth: @role(role: "admin") — requires specific role
+            if ($d['name'] === 'role') {
+                $requiredRole = $d['args']['role'] ?? null;
+                $userRole = $context['user']['role'] ?? ($context['role'] ?? null);
+                if ($requiredRole === null || $userRole !== $requiredRole) {
+                    return false;
+                }
+            }
+
+            // Auth: @guest — only accessible to unauthenticated users
+            if ($d['name'] === 'guest') {
+                if (!empty($context['user'])) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Validate resolved arguments against their declared types.
+     *
+     * Returns an array of error objects. Empty array = valid.
+     */
+    private function validateArgs(array $args, array $argConfigs, string $fieldName): array
+    {
+        $errors = [];
+
+        foreach ($argConfigs as $argName => $declaredType) {
+            $parsed = GraphQLType::parse($declaredType);
+            $value = $args[$argName] ?? null;
+            $isNonNull = $parsed->kind === 'non_null';
+
+            // Unwrap non_null to get the inner type
+            $innerType = $isNonNull ? $parsed->ofType : $parsed;
+            $baseName = $innerType->kind === 'list' ? 'list' : $innerType->name;
+
+            // Non-null check
+            if ($isNonNull && ($value === null || $value === '')) {
+                $errors[] = [
+                    'message' => "Argument '{$argName}' on field '{$fieldName}' is required (type: {$declaredType})",
+                    'path' => [$fieldName],
+                ];
+                continue;
+            }
+
+            if ($value === null) {
+                continue;
+            }
+
+            // List validation
+            if ($baseName === 'list' && is_array($value)) {
+                $itemType = $innerType->ofType;
+                if ($itemType) {
+                    $itemName = $itemType->kind === 'non_null' ? ($itemType->ofType->name ?? 'String') : $itemType->name;
+                    foreach ($value as $i => $item) {
+                        $coerced = $this->coerceValue($item, $itemName);
+                        if ($coerced === false && $item !== false) {
+                            $errors[] = [
+                                'message' => "Argument '{$argName}[{$i}]' on field '{$fieldName}' expected {$itemName}, got " . gettype($item),
+                                'path' => [$fieldName],
+                            ];
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Scalar type coercion + validation
+            if (in_array($baseName, GraphQLType::SCALARS, true)) {
+                $coerced = $this->coerceValue($value, $baseName);
+                if ($coerced === false && $value !== false) {
+                    $errors[] = [
+                        'message' => "Argument '{$argName}' on field '{$fieldName}' expected type {$baseName}, got " . gettype($value),
+                        'path' => [$fieldName],
+                    ];
+                }
+            }
+        }
+
+        return $errors;
+    }
+
+    /**
+     * Attempt to coerce a value to the declared GraphQL scalar type.
+     *
+     * Returns the coerced value, or false if coercion is impossible.
+     */
+    private function coerceValue(mixed $value, string $type): mixed
+    {
+        return match ($type) {
+            'Int' => is_numeric($value) ? (int)$value : false,
+            'Float' => is_numeric($value) ? (float)$value : false,
+            'Boolean' => is_bool($value) || in_array($value, [0, 1, '0', '1', 'true', 'false'], true)
+                ? filter_var($value, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE) ?? false
+                : false,
+            'String', 'ID' => is_scalar($value) ? (string)$value : false,
+            default => $value, // Custom types — pass through
+        };
+    }
+
+    /**
+     * Check if an array is associative.
+     */
+    private function isAssoc(array $arr): bool
+    {
+        if (empty($arr)) {
+            return false;
+        }
+        return array_keys($arr) !== range(0, count($arr) - 1);
+    }
+
+    /**
+     * Auto-generate type, queries, and CRUD mutations from an ORM class.
+     *
+     * Creates:
+     *   - A GraphQL type from the ORM's table columns
+     *   - Queries: {modelName}(id: ID!): Type, {modelNames}(limit: Int, offset: Int): [Type]
+     *   - Mutations: create{ModelName}, update{ModelName}, delete{ModelName}
+     *
+     * @param ORM $ormInstance An instance of the ORM subclass (must have setDb() called)
+     * @return self
+     */
+    public function fromOrm(ORM $ormInstance): self
+    {
+        // TINA4_GRAPHQL_AUTO_SCHEMA — when explicitly false, callers asking for
+        // auto-schema generation get a clean self instead of an introspected one.
+        // Defaults to true to match Python's tina4_python.graphql behavior.
+        if (!DotEnv::isTruthy(DotEnv::getEnv('TINA4_GRAPHQL_AUTO_SCHEMA', 'true'))) {
+            return $this;
+        }
+
+        $db = $ormInstance->getDb();
+        if ($db === null) {
+            // Try to resolve the database the same way ORM::ensureDb() does
+            $db = ORM::getGlobalDb() ?? App::getDatabase() ?? Database\Database::fromEnv();
+            if ($db !== null) {
+                $ormInstance->setDb($db);
+            } else {
+                throw new \RuntimeException('GraphQL::fromOrm() requires an ORM instance with a database adapter set.');
+            }
+        }
+
+        $className = (new \ReflectionClass($ormInstance))->getShortName();
+        $tableName = $ormInstance->tableName;
+        $primaryKey = $ormInstance->primaryKey;
+
+        // Get column metadata from the database
+        $columns = $db->getColumns($tableName);
+
+        // Build GraphQL fields from column definitions
+        $gqlFields = [];
+        foreach ($columns as $col) {
+            $colName = $col['name'];
+            $colType = strtoupper($col['type'] ?? 'TEXT');
+
+            if ($col['primary'] ?? false) {
+                $gqlType = 'ID';
+            } elseif (str_contains($colType, 'INT')) {
+                $gqlType = 'Int';
+            } elseif (str_contains($colType, 'REAL') || str_contains($colType, 'FLOAT')
+                || str_contains($colType, 'DOUBLE') || str_contains($colType, 'NUMERIC')
+                || str_contains($colType, 'DECIMAL')) {
+                $gqlType = 'Float';
+            } elseif (str_contains($colType, 'BOOL')) {
+                $gqlType = 'Boolean';
+            } else {
+                $gqlType = 'String';
+            }
+
+            $gqlFields[$colName] = $gqlType;
+        }
+
+        // If no columns found, create a minimal type with just the primary key
+        if (empty($gqlFields)) {
+            $gqlFields[$primaryKey] = 'ID';
+        }
+
+        $this->addType($className, $gqlFields);
+
+        // Build singular/plural names
+        $singular = lcfirst($className);
+        $plural = $singular . 's';
+
+        // Query: single record by ID
+        $this->addQuery($singular, ['id' => 'ID!'], $className, function ($root, $args, $context) use ($ormInstance) {
+            $model = clone $ormInstance;
+            $model->load($args['id']);
+            return $model->exists() ? $model->toDict() : null;
+        });
+
+        // Query: list with pagination
+        $this->addQuery($plural, ['limit' => 'Int', 'offset' => 'Int'], "[{$className}]", function ($root, $args, $context) use ($ormInstance) {
+            $limit = $args['limit'] ?? 10;
+            $offset = $args['offset'] ?? 0;
+            $models = $ormInstance->all($limit, $offset);
+            $records = [];
+            foreach ($models as $model) {
+                $records[] = $model->toDict();
+            }
+            return $records;
+        });
+
+        // Build mutation args (all fields except PK)
+        $mutationArgs = [];
+        foreach ($gqlFields as $field => $type) {
+            if ($field !== $primaryKey) {
+                $mutationArgs[$field] = 'String';
+            }
+        }
+
+        // Mutation: create
+        $this->addMutation("create{$className}", $mutationArgs, $className, function ($root, $args, $context) use ($ormInstance) {
+            $model = clone $ormInstance;
+            $model->fill($args);
+            $model->save();
+            return $model->toDict();
+        });
+
+        // Mutation: update
+        $updateArgs = array_merge(['id' => 'ID!'], $mutationArgs);
+        $this->addMutation("update{$className}", $updateArgs, $className, function ($root, $args, $context) use ($ormInstance, $primaryKey) {
+            $model = clone $ormInstance;
+            $model->load($args['id']);
+            if (!$model->exists()) {
+                return null;
+            }
+            $data = $args;
+            unset($data['id']);
+            $model->fill($data);
+            $model->save();
+            return $model->toDict();
+        });
+
+        // Mutation: delete
+        $this->addMutation("delete{$className}", ['id' => 'ID!'], 'Boolean', function ($root, $args, $context) use ($ormInstance) {
+            $model = clone $ormInstance;
+            $model->load($args['id']);
+            if (!$model->exists()) {
+                return false;
+            }
+            $model->delete();
+            return true;
+        });
+
+        return $this;
+    }
+
+    /**
+     * Map a database column type string to a GraphQL type.
+     *
+     * @param string $dbType The database column type (e.g. 'INTEGER', 'TEXT', 'REAL')
+     * @return string The GraphQL type name
+     */
+    private function dbTypeToGraphQL(string $dbType): string
+    {
+        $dbType = strtoupper($dbType);
+        if (str_contains($dbType, 'INT')) {
+            return 'Int';
+        }
+        if (str_contains($dbType, 'REAL') || str_contains($dbType, 'FLOAT')
+            || str_contains($dbType, 'DOUBLE') || str_contains($dbType, 'NUMERIC')
+            || str_contains($dbType, 'DECIMAL')) {
+            return 'Float';
+        }
+        if (str_contains($dbType, 'BOOL')) {
+            return 'Boolean';
+        }
+        return 'String';
+    }
+
+    /**
+     * Format argument definitions for SDL.
+     */
+    private function formatArgs(array $args): string
+    {
+        if (empty($args)) {
+            return '';
+        }
+        $parts = [];
+        foreach ($args as $name => $type) {
+            $parts[] = "{$name}: {$type}";
+        }
+        return '(' . implode(', ', $parts) . ')';
+    }
+}
+
+/**
+ * Recursive-descent GraphQL parser.
+ */
+class GraphQLParser
+{
+    private array $tokens;
+    private int $pos = 0;
+
+    public function __construct(array $tokens)
+    {
+        $this->tokens = $tokens;
+    }
+
+    public function parse(): array
+    {
+        $doc = ['definitions' => []];
+        while ($this->pos < count($this->tokens)) {
+            $doc['definitions'][] = $this->parseDefinition();
+        }
+        return $doc;
+    }
+
+    public function peek(int $offset = 0): ?array
+    {
+        return $this->tokens[$this->pos + $offset] ?? null;
+    }
+
+    public function advance(): array
+    {
+        return $this->tokens[$this->pos++];
+    }
+
+    public function expect(string $type, ?string $value = null): array
+    {
+        $t = $this->peek();
+        if (!$t || $t['type'] !== $type || ($value !== null && $t['value'] !== $value)) {
+            $expected = $value ? "{$type}({$value})" : $type;
+            $got = $t ? "{$t['type']}({$t['value']})" : 'EOF';
+            throw new \RuntimeException("Expected {$expected}, got {$got}");
+        }
+        return $this->advance();
+    }
+
+    public function match(string $type, ?string $value = null): ?array
+    {
+        $t = $this->peek();
+        if ($t && $t['type'] === $type && ($value === null || $t['value'] === $value)) {
+            return $this->advance();
+        }
+        return null;
+    }
+
+    private function parseDefinition(): array
+    {
+        $t = $this->peek();
+        if ($t && $t['type'] === 'NAME' && $t['value'] === 'fragment') {
+            return $this->parseFragment();
+        }
+        return $this->parseOperation();
+    }
+
+    private function parseOperation(): array
+    {
+        $t = $this->peek();
+        $opType = 'query';
+        $name = null;
+        $variables = [];
+
+        if ($t && $t['type'] === 'NAME' && in_array($t['value'], ['query', 'mutation', 'subscription'])) {
+            $opType = $this->advance()['value'];
+            $next = $this->peek();
+            if ($next && $next['type'] === 'NAME') {
+                $name = $this->advance()['value'];
+            }
+            if ($this->match('LPAREN')) {
+                $variables = $this->parseVariableDefs();
+                $this->expect('RPAREN');
+            }
+        }
+
+        $directives = $this->parseDirectives();
+        $selections = $this->parseSelectionSet();
+
+        return [
+            'kind' => 'operation',
+            'operation' => $opType,
+            'name' => $name,
+            'variables' => $variables,
+            'directives' => $directives,
+            'selections' => $selections,
+        ];
+    }
+
+    private function parseFragment(): array
+    {
+        $this->expect('NAME', 'fragment');
+        $name = $this->expect('NAME')['value'];
+        $this->expect('NAME', 'on');
+        $typeName = $this->expect('NAME')['value'];
+        $directives = $this->parseDirectives();
+        $selections = $this->parseSelectionSet();
+
+        return [
+            'kind' => 'fragment',
+            'name' => $name,
+            'on' => $typeName,
+            'directives' => $directives,
+            'selections' => $selections,
+        ];
+    }
+
+    private function parseSelectionSet(): array
+    {
+        $this->expect('LBRACE');
+        $selections = [];
+
+        while (!$this->match('RBRACE')) {
+            if ($this->match('SPREAD')) {
+                $next = $this->peek();
+                if ($next && $next['type'] === 'NAME' && $next['value'] === 'on') {
+                    $this->advance();
+                    $typeName = $this->expect('NAME')['value'];
+                    $directives = $this->parseDirectives();
+                    $sels = $this->parseSelectionSet();
+                    $selections[] = [
+                        'kind' => 'inline_fragment',
+                        'on' => $typeName,
+                        'directives' => $directives,
+                        'selections' => $sels,
+                    ];
+                } elseif ($next && $next['type'] === 'LBRACE') {
+                    $directives = $this->parseDirectives();
+                    $sels = $this->parseSelectionSet();
+                    $selections[] = [
+                        'kind' => 'inline_fragment',
+                        'on' => null,
+                        'directives' => $directives,
+                        'selections' => $sels,
+                    ];
+                } else {
+                    $fragName = $this->expect('NAME')['value'];
+                    $directives = $this->parseDirectives();
+                    $selections[] = [
+                        'kind' => 'fragment_spread',
+                        'name' => $fragName,
+                        'directives' => $directives,
+                    ];
+                }
+            } else {
+                $selections[] = $this->parseField();
+            }
+        }
+
+        return $selections;
+    }
+
+    private function parseField(): array
+    {
+        $name = $this->expect('NAME')['value'];
+        $alias = null;
+
+        if ($this->match('COLON')) {
+            $alias = $name;
+            $name = $this->expect('NAME')['value'];
+        }
+
+        $args = [];
+        if ($this->match('LPAREN')) {
+            $args = $this->parseArguments();
+            $this->expect('RPAREN');
+        }
+
+        $directives = $this->parseDirectives();
+
+        $selections = null;
+        $next = $this->peek();
+        if ($next && $next['type'] === 'LBRACE') {
+            $selections = $this->parseSelectionSet();
+        }
+
+        return [
+            'kind' => 'field',
+            'name' => $name,
+            'alias' => $alias,
+            'args' => $args,
+            'directives' => $directives,
+            'selections' => $selections,
+        ];
+    }
+
+    private function parseArguments(): array
+    {
+        $args = [];
+        while ($this->peek() && $this->peek()['type'] !== 'RPAREN') {
+            $name = $this->expect('NAME')['value'];
+            $this->expect('COLON');
+            $args[$name] = $this->parseValue();
+            $this->match('COMMA');
+        }
+        return $args;
+    }
+
+    private function parseValue(): mixed
+    {
+        $t = $this->peek();
+        if (!$t) {
+            throw new \RuntimeException('Unexpected EOF in value');
+        }
+
+        switch ($t['type']) {
+            case 'STRING':
+                $this->advance();
+                $inner = substr($t['value'], 1, -1);
+                return str_replace(['\\"', '\\\\'], ['"', '\\'], $inner);
+
+            case 'NUMBER':
+                $this->advance();
+                if (str_contains($t['value'], '.') || stripos($t['value'], 'e') !== false) {
+                    return (float)$t['value'];
+                }
+                return (int)$t['value'];
+
+            case 'BOOL':
+                $this->advance();
+                return $t['value'] === 'true';
+
+            case 'NULL':
+                $this->advance();
+                return null;
+
+            case 'NAME':
+                $this->advance();
+                return $t['value'];
+
+            case 'DOLLAR':
+                $this->advance();
+                $name = $this->expect('NAME')['value'];
+                return ['$var' => $name];
+
+            case 'LBRACKET':
+                $this->advance();
+                $items = [];
+                while (!$this->match('RBRACKET')) {
+                    $items[] = $this->parseValue();
+                }
+                return $items;
+
+            case 'LBRACE':
+                $this->advance();
+                $obj = [];
+                while (!$this->match('RBRACE')) {
+                    $key = $this->expect('NAME')['value'];
+                    $this->expect('COLON');
+                    $obj[$key] = $this->parseValue();
+                }
+                return $obj;
+
+            default:
+                throw new \RuntimeException("Unexpected token: {$t['type']}({$t['value']})");
+        }
+    }
+
+    private function parseDirectives(): array
+    {
+        $directives = [];
+        while ($this->peek() && $this->peek()['type'] === 'AT') {
+            $this->advance();
+            $name = $this->expect('NAME')['value'];
+            $args = [];
+            if ($this->match('LPAREN')) {
+                $args = $this->parseArguments();
+                $this->expect('RPAREN');
+            }
+            $directives[] = ['name' => $name, 'args' => $args];
+        }
+        return $directives;
+    }
+
+    private function parseVariableDefs(): array
+    {
+        $defs = [];
+        while ($this->peek() && $this->peek()['type'] === 'DOLLAR') {
+            $this->advance();
+            $name = $this->expect('NAME')['value'];
+            $this->expect('COLON');
+            $typeName = $this->parseTypeRef();
+            $default = null;
+            if ($this->match('EQUALS')) {
+                $default = $this->parseValue();
+            }
+            $defs[] = ['name' => $name, 'type' => $typeName, 'default' => $default];
+            $this->match('COMMA');
+        }
+        return $defs;
+    }
+
+    private function parseTypeRef(): string
+    {
+        if ($this->match('LBRACKET')) {
+            $inner = $this->parseTypeRef();
+            $this->expect('RBRACKET');
+            $t = "[{$inner}]";
+        } else {
+            $t = $this->expect('NAME')['value'];
+        }
+        if ($this->match('BANG')) {
+            $t .= '!';
+        }
+        return $t;
+    }
+}
+
+/**
+ * Lightweight GraphQL type wrapper matching Ruby's GraphQLType.
+ */
+class GraphQLType
+{
+    public const SCALARS = ['String', 'Int', 'Float', 'Boolean', 'ID'];
+
+    public string $name;
+    public string $kind;
+    public ?GraphQLType $ofType;
+
+    public function __construct(string $name, string $kind = 'object', ?GraphQLType $ofType = null)
+    {
+        $this->name = $name;
+        $this->kind = $kind;
+        $this->ofType = $ofType;
+    }
+
+    /**
+     * Parse a GraphQL type string like "String", "String!", "[Int!]!".
+     */
+    public static function parse(string $typeStr): self
+    {
+        $s = trim($typeStr);
+        if (str_ends_with($s, '!')) {
+            $inner = self::parse(substr($s, 0, -1));
+            return new self($s, 'non_null', $inner);
+        }
+        if (str_starts_with($s, '[') && str_ends_with($s, ']')) {
+            $inner = self::parse(substr($s, 1, -1));
+            return new self($s, 'list', $inner);
+        }
+        if (in_array($s, self::SCALARS, true)) {
+            return new self($s, 'scalar');
+        }
+        return new self($s, 'object');
+    }
+}

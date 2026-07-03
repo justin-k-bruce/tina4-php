@@ -1,0 +1,1949 @@
+<?php
+
+/**
+ * Tina4 — The Intelligent Native Application 4ramework
+ * Copyright 2007 - current Tina4
+ * License: MIT https://opensource.org/licenses/MIT
+ *
+ * MCP (Model Context Protocol) server for AI tool integration.
+ *
+ * Built-in MCP server for dev tools + developer API for custom MCP servers.
+ *
+ * Usage (developer):
+ *
+ *     use Tina4\McpServer;
+ *
+ *     $mcp = new McpServer("/my-mcp", "My App Tools");
+ *
+ *     $mcp->registerTool("lookup_invoice", function(string $invoiceNo): array {
+ *         return $db->fetchOne("SELECT * FROM invoices WHERE invoice_no = ?", [$invoiceNo]);
+ *     }, "Find invoice by number");
+ *
+ *     $mcp->registerResource("app://schema", function() use ($db) {
+ *         return $db->getDatabase();
+ *     }, "Database schema");
+ *
+ * Built-in dev tools auto-register when TINA4_DEBUG=true and running on localhost.
+ */
+
+namespace Tina4;
+
+// ── PHP 8.1+ Attributes ──────────────────────────────────────────
+
+/**
+ * Mark a method as an MCP tool.
+ *
+ * Usage:
+ *     #[McpTool("lookup_invoice", "Find invoice by number")]
+ *     public function lookupInvoice(string $invoiceNo): array { ... }
+ */
+#[\Attribute(\Attribute::TARGET_METHOD | \Attribute::TARGET_FUNCTION)]
+class McpTool
+{
+    public function __construct(
+        public string $name = '',
+        public string $description = ''
+    ) {
+    }
+}
+
+/**
+ * Mark a method as an MCP resource.
+ *
+ * Usage:
+ *     #[McpResource("app://tables", "Database tables")]
+ *     public function getTables(): array { ... }
+ */
+#[\Attribute(\Attribute::TARGET_METHOD | \Attribute::TARGET_FUNCTION)]
+class McpResource
+{
+    public function __construct(
+        public string $uri = '',
+        public string $description = '',
+        public string $mimeType = 'application/json'
+    ) {
+    }
+}
+
+// ── JSON-RPC 2.0 Codec ──────────────────────────────────────────
+
+/**
+ * Static methods for JSON-RPC 2.0 encode/decode. Zero dependencies.
+ */
+class McpProtocol
+{
+    // Standard JSON-RPC 2.0 error codes
+    public const PARSE_ERROR = -32700;
+    public const INVALID_REQUEST = -32600;
+    public const METHOD_NOT_FOUND = -32601;
+    public const INVALID_PARAMS = -32602;
+    public const INTERNAL_ERROR = -32603;
+
+    /**
+     * Encode a successful JSON-RPC 2.0 response.
+     */
+    public static function encodeResponse(mixed $requestId, mixed $result): string
+    {
+        return json_encode([
+            'jsonrpc' => '2.0',
+            'id' => $requestId,
+            'result' => $result,
+        ], JSON_UNESCAPED_SLASHES);
+    }
+
+    /**
+     * Encode a JSON-RPC 2.0 error response.
+     */
+    public static function encodeError(mixed $requestId, int $code, string $message, mixed $data = null): string
+    {
+        $error = ['code' => $code, 'message' => $message];
+        if ($data !== null) {
+            $error['data'] = $data;
+        }
+        return json_encode([
+            'jsonrpc' => '2.0',
+            'id' => $requestId,
+            'error' => $error,
+        ], JSON_UNESCAPED_SLASHES);
+    }
+
+    /**
+     * Encode a JSON-RPC 2.0 notification (no id).
+     */
+    public static function encodeNotification(string $method, mixed $params = null): string
+    {
+        $msg = ['jsonrpc' => '2.0', 'method' => $method];
+        if ($params !== null) {
+            $msg['params'] = $params;
+        }
+        return json_encode($msg, JSON_UNESCAPED_SLASHES);
+    }
+
+    /**
+     * Decode a JSON-RPC 2.0 request.
+     *
+     * @param string|array $data Raw JSON string or pre-parsed array
+     * @return array{0: string, 1: array, 2: mixed} [method, params, requestId]
+     * @throws \ValueError If the message is malformed
+     */
+    public static function decodeRequest(string|array $data): array
+    {
+        if (is_string($data)) {
+            $msg = json_decode($data, true);
+            if ($msg === null && json_last_error() !== JSON_ERROR_NONE) {
+                throw new \ValueError('Invalid JSON: ' . json_last_error_msg());
+            }
+        } else {
+            $msg = $data;
+        }
+
+        if (!is_array($msg)) {
+            throw new \ValueError('Message must be a JSON object');
+        }
+
+        if (($msg['jsonrpc'] ?? null) !== '2.0') {
+            throw new \ValueError('Missing or invalid jsonrpc version');
+        }
+
+        $method = $msg['method'] ?? null;
+        if (!$method || !is_string($method)) {
+            throw new \ValueError('Missing or invalid method');
+        }
+
+        $params = $msg['params'] ?? [];
+        $requestId = $msg['id'] ?? null; // null for notifications
+
+        return [$method, $params, $requestId];
+    }
+}
+
+// ── Schema Extraction ────────────────────────────────────────────
+
+/**
+ * Extract JSON Schema from PHP type hints using Reflection.
+ */
+class McpSchema
+{
+    /** PHP type name -> JSON Schema type */
+    private const TYPE_MAP = [
+        'string' => 'string',
+        'int' => 'integer',
+        'float' => 'number',
+        'bool' => 'boolean',
+        'array' => 'array',
+        'object' => 'object',
+    ];
+
+    /**
+     * Extract JSON Schema inputSchema from a callable's type hints.
+     */
+    public static function fromCallable(callable $callable): array
+    {
+        if ($callable instanceof \Closure) {
+            $ref = new \ReflectionFunction($callable);
+        } elseif (is_array($callable)) {
+            $ref = new \ReflectionMethod($callable[0], $callable[1]);
+        } elseif (is_string($callable) && strpos($callable, '::') !== false) {
+            $ref = new \ReflectionMethod($callable);
+        } elseif (is_string($callable)) {
+            $ref = new \ReflectionFunction($callable);
+        } else {
+            // Invokable object
+            $ref = new \ReflectionMethod($callable, '__invoke');
+        }
+
+        return self::fromReflection($ref);
+    }
+
+    /**
+     * Extract JSON Schema from a ReflectionFunctionAbstract.
+     */
+    public static function fromReflection(\ReflectionFunctionAbstract $ref): array
+    {
+        $properties = [];
+        $required = [];
+
+        foreach ($ref->getParameters() as $param) {
+            $name = $param->getName();
+
+            // Skip $this for bound closures (shouldn't appear) and self/static
+            if ($name === 'self' || $name === 'this') {
+                continue;
+            }
+
+            $type = $param->getType();
+            $jsonType = 'string'; // default
+
+            if ($type instanceof \ReflectionNamedType) {
+                $typeName = $type->getName();
+                $jsonType = self::TYPE_MAP[$typeName] ?? 'string';
+            }
+
+            $prop = ['type' => $jsonType];
+
+            if ($param->isDefaultValueAvailable()) {
+                $prop['default'] = $param->getDefaultValue();
+            } else {
+                $required[] = $name;
+            }
+
+            $properties[$name] = $prop;
+        }
+
+        $schema = ['type' => 'object', 'properties' => $properties];
+        if (!empty($required)) {
+            $schema['required'] = $required;
+        }
+        return $schema;
+    }
+}
+
+// ── MCP Server ───────────────────────────────────────────────────
+
+/**
+ * MCP server that registers tools and resources on a given HTTP path.
+ */
+class McpServer
+{
+    /** @var McpServer[] Class-level registry of all MCP server instances */
+    private static array $instances = [];
+
+    /** @var McpServer|null Default server for decorator helpers */
+    private static ?McpServer $defaultServer = null;
+
+    /**
+     * Get (or create) the default server used by mcp_tool() / mcp_resource() helpers.
+     *
+     * First-call side effect: the 24-tool built-in dev toolkit
+     * (McpDevTools) is registered on the server so the REST shim and
+     * JSON-RPC endpoint both see a populated registry. Without this,
+     * /__dev/api/mcp/tools would return an empty list. Registration is
+     * idempotent — tool names are hash keys, so re-registering is a no-op.
+     * Matches Python's `_get_default_server()`.
+     */
+    public static function getDefaultServer(): McpServer
+    {
+        if (self::$defaultServer === null) {
+            self::$defaultServer = new McpServer('/__dev/mcp', 'Tina4 Dev Tools');
+            try {
+                McpDevTools::register(self::$defaultServer);
+            } catch (\Throwable $exc) {
+                // Don't let a bad tool module prevent the server from existing —
+                // the REST shim should still return an empty list rather than
+                // crashing the request.
+                error_log('[mcp] dev tool registration failed: ' . $exc->getMessage());
+            }
+        }
+        return self::$defaultServer;
+    }
+
+    /**
+     * Reset the default server (test helper — forces re-registration on next call).
+     */
+    public static function resetDefaultServer(): void
+    {
+        self::$defaultServer = null;
+    }
+
+    /**
+     * Return the list of registered tools on this server (name + description + schema).
+     * Used by the /__dev/api/mcp/tools REST shim.
+     */
+    public function getToolList(): array
+    {
+        $tools = [];
+        foreach ($this->tools as $t) {
+            $tools[] = [
+                'name' => $t['name'],
+                'description' => $t['description'],
+                'schema' => $t['inputSchema'],
+            ];
+        }
+        return $tools;
+    }
+
+    /**
+     * Invoke a registered tool by name with positional arguments drawn
+     * from the `$arguments` associative array (Python-parity). Returns
+     * the raw handler result (not wrapped in MCP content).
+     *
+     * @throws \RuntimeException if the tool is unknown
+     */
+    public function callTool(string $name, array $arguments = []): mixed
+    {
+        $tool = $this->tools[$name] ?? null;
+        if ($tool === null) {
+            throw new \RuntimeException("Unknown tool: {$name}");
+        }
+        $handler = $tool['handler'];
+        $schema = $tool['inputSchema'] ?? ['properties' => []];
+        $props = $schema['properties'] ?? [];
+        $positional = [];
+        foreach ($props as $argName => $_) {
+            if (array_key_exists($argName, $arguments)) {
+                $positional[] = $arguments[$argName];
+            } else {
+                // Parameter missing — let the callable's own defaults
+                // handle it; stop collecting positionals at the first gap.
+                break;
+            }
+        }
+        return $handler(...$positional);
+    }
+
+    private string $path;
+    private string $name;
+    private string $version;
+    private array $tools = [];
+    private array $resources = [];
+    private bool $initialized = false;
+
+    public function __construct(string $path, string $name = 'Tina4 MCP', string $version = '1.0.0')
+    {
+        $this->path = rtrim($path, '/');
+        $this->name = $name;
+        $this->version = $version;
+        self::$instances[] = $this;
+    }
+
+    /**
+     * Get the server path.
+     */
+    public function getPath(): string
+    {
+        return $this->path;
+    }
+
+    /**
+     * Get the server name.
+     */
+    public function getName(): string
+    {
+        return $this->name;
+    }
+
+    /**
+     * Register a tool callable.
+     */
+    public function registerTool(string $name, callable $handler, string $description = '', ?array $schema = null): void
+    {
+        if ($schema === null) {
+            $schema = McpSchema::fromCallable($handler);
+        }
+
+        $this->tools[$name] = [
+            'name' => $name,
+            'description' => $description,
+            'inputSchema' => $schema,
+            'handler' => $handler,
+        ];
+    }
+
+    /**
+     * Register a resource URI.
+     */
+    public function registerResource(string $uri, callable $handler, string $description = '', string $mimeType = 'application/json'): void
+    {
+        $this->resources[$uri] = [
+            'uri' => $uri,
+            'name' => $description ?: $uri,
+            'description' => $description,
+            'mimeType' => $mimeType,
+            'handler' => $handler,
+        ];
+    }
+
+    /**
+     * Register tools and resources from an object using PHP 8.1+ attributes.
+     *
+     * Scans all public methods of $object for #[McpTool] and #[McpResource] attributes.
+     */
+    public function registerFromAttributes(object $object): void
+    {
+        $ref = new \ReflectionObject($object);
+
+        foreach ($ref->getMethods(\ReflectionMethod::IS_PUBLIC) as $method) {
+            // Check for McpTool attribute
+            $toolAttrs = $method->getAttributes(McpTool::class);
+            foreach ($toolAttrs as $attr) {
+                /** @var McpTool $tool */
+                $tool = $attr->newInstance();
+                $toolName = $tool->name ?: $method->getName();
+                $description = $tool->description;
+                $callable = [$object, $method->getName()];
+                $this->registerTool($toolName, $callable, $description);
+            }
+
+            // Check for McpResource attribute
+            $resAttrs = $method->getAttributes(McpResource::class);
+            foreach ($resAttrs as $attr) {
+                /** @var McpResource $res */
+                $res = $attr->newInstance();
+                $callable = [$object, $method->getName()];
+                $this->registerResource($res->uri, $callable, $res->description, $res->mimeType);
+            }
+        }
+    }
+
+    /**
+     * Process an incoming JSON-RPC message and return the response.
+     */
+    public function handleMessage(string|array $rawData): string
+    {
+        try {
+            [$method, $params, $requestId] = McpProtocol::decodeRequest($rawData);
+        } catch (\ValueError $e) {
+            return McpProtocol::encodeError(null, McpProtocol::PARSE_ERROR, $e->getMessage());
+        }
+
+        $handlers = [
+            'initialize' => [$this, 'handleInitialize'],
+            'notifications/initialized' => [$this, 'handleInitialized'],
+            'tools/list' => [$this, 'handleToolsList'],
+            'tools/call' => [$this, 'handleToolsCall'],
+            'resources/list' => [$this, 'handleResourcesList'],
+            'resources/read' => [$this, 'handleResourcesRead'],
+            'ping' => [$this, 'handlePing'],
+        ];
+
+        $handler = $handlers[$method] ?? null;
+
+        if ($handler === null) {
+            return McpProtocol::encodeError(
+                $requestId,
+                McpProtocol::METHOD_NOT_FOUND,
+                "Method not found: $method"
+            );
+        }
+
+        try {
+            $result = $handler($params);
+            if ($requestId === null) {
+                return ''; // Notification - no response
+            }
+            return McpProtocol::encodeResponse($requestId, $result);
+        } catch (\Throwable $e) {
+            return McpProtocol::encodeError($requestId, McpProtocol::INTERNAL_ERROR, $e->getMessage());
+        }
+    }
+
+    /**
+     * Handle initialize request - return server capabilities.
+     */
+    private function handleInitialize(array $params): array
+    {
+        $this->initialized = true;
+        return [
+            'protocolVersion' => '2024-11-05',
+            'capabilities' => [
+                'tools' => ['listChanged' => false],
+                'resources' => ['subscribe' => false, 'listChanged' => false],
+            ],
+            'serverInfo' => [
+                'name' => $this->name,
+                'version' => $this->version,
+            ],
+        ];
+    }
+
+    /**
+     * Handle initialized notification.
+     */
+    private function handleInitialized(array $params): array
+    {
+        return [];
+    }
+
+    /**
+     * Handle ping.
+     */
+    private function handlePing(array $params): array
+    {
+        return [];
+    }
+
+    /**
+     * Return list of registered tools.
+     */
+    private function handleToolsList(array $params): array
+    {
+        $tools = [];
+        foreach ($this->tools as $t) {
+            $tools[] = [
+                'name' => $t['name'],
+                'description' => $t['description'],
+                'inputSchema' => $t['inputSchema'],
+            ];
+        }
+        return ['tools' => $tools];
+    }
+
+    /**
+     * Invoke a tool by name.
+     */
+    private function handleToolsCall(array $params): array
+    {
+        $toolName = $params['name'] ?? null;
+        if (!$toolName) {
+            throw new \RuntimeException('Missing tool name');
+        }
+
+        $tool = $this->tools[$toolName] ?? null;
+        if (!$tool) {
+            throw new \RuntimeException("Unknown tool: $toolName");
+        }
+
+        $arguments = $params['arguments'] ?? [];
+        $handler = $tool['handler'];
+
+        // Call the handler with named arguments
+        $result = $handler(...$arguments);
+
+        // Format result as MCP content
+        if (is_string($result)) {
+            $content = [['type' => 'text', 'text' => $result]];
+        } elseif (is_array($result) || is_object($result)) {
+            $content = [['type' => 'text', 'text' => json_encode($result, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)]];
+        } else {
+            $content = [['type' => 'text', 'text' => (string)$result]];
+        }
+
+        return ['content' => $content];
+    }
+
+    /**
+     * Return list of registered resources.
+     */
+    private function handleResourcesList(array $params): array
+    {
+        $resources = [];
+        foreach ($this->resources as $r) {
+            $resources[] = [
+                'uri' => $r['uri'],
+                'name' => $r['name'],
+                'description' => $r['description'],
+                'mimeType' => $r['mimeType'],
+            ];
+        }
+        return ['resources' => $resources];
+    }
+
+    /**
+     * Read a resource by URI.
+     */
+    private function handleResourcesRead(array $params): array
+    {
+        $uri = $params['uri'] ?? null;
+        if (!$uri) {
+            throw new \RuntimeException('Missing resource URI');
+        }
+
+        $resource = $this->resources[$uri] ?? null;
+        if (!$resource) {
+            throw new \RuntimeException("Unknown resource: $uri");
+        }
+
+        $result = ($resource['handler'])();
+
+        if (is_string($result)) {
+            $text = $result;
+        } elseif (is_array($result) || is_object($result)) {
+            $text = json_encode($result, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+        } else {
+            $text = (string)$result;
+        }
+
+        return [
+            'contents' => [[
+                'uri' => $uri,
+                'mimeType' => $resource['mimeType'],
+                'text' => $text,
+            ]],
+        ];
+    }
+
+    /**
+     * Register HTTP routes for this MCP server on the Tina4 router.
+     *
+     * Registers:
+     *     POST {path}/message - JSON-RPC message endpoint
+     *     GET  {path}/sse     - SSE endpoint for streaming
+     */
+    public function registerRoutes($router = null): void
+    {
+        $server = $this;
+        $msgPath = $this->path . '/message';
+        $ssePath = $this->path . '/sse';
+
+        Router::post($msgPath, function (Request $request, Response $response) use ($server) {
+            $body = $request->body;
+            if (is_string($body)) {
+                $raw = $body;
+            } elseif (is_array($body)) {
+                $raw = $body;
+            } else {
+                $raw = (string)$body;
+            }
+            $result = $server->handleMessage($raw);
+            if ($result === '') {
+                return $response('', 204);
+            }
+            return $response(json_decode($result, true));
+        })->noAuth();
+
+        Router::get($ssePath, function (Request $request, Response $response) use ($server) {
+            $baseUrl = rtrim($request->url ?? '', '/');
+            // Strip /sse from end to get base path
+            $basePath = preg_replace('#/sse$#', '', $baseUrl);
+            $endpointUrl = $basePath . '/message';
+            $sseData = "event: endpoint\ndata: $endpointUrl\n\n";
+
+            header('Content-Type: text/event-stream');
+            header('Cache-Control: no-cache');
+            header('Connection: keep-alive');
+            echo $sseData;
+            flush();
+            return null;
+        })->noAuth();
+    }
+
+    /**
+     * Write/update .claude/settings.json with this MCP server config.
+     */
+    public function writeClaudeConfig(int $port = 7146): void
+    {
+        $configDir = '.claude';
+        if (!is_dir($configDir)) {
+            mkdir($configDir, 0755, true);
+        }
+        $configFile = $configDir . '/settings.json';
+
+        $config = [];
+        if (file_exists($configFile)) {
+            $contents = file_get_contents($configFile);
+            $decoded = json_decode($contents, true);
+            if (is_array($decoded)) {
+                $config = $decoded;
+            }
+        }
+
+        if (!isset($config['mcpServers'])) {
+            $config['mcpServers'] = [];
+        }
+
+        $serverKey = strtolower(str_replace(' ', '-', $this->name));
+        $config['mcpServers'][$serverKey] = [
+            'url' => "http://localhost:{$port}{$this->path}/sse",
+        ];
+
+        file_put_contents($configFile, json_encode($config, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n");
+    }
+
+    /**
+     * Informational only — whether the CONFIGURED host looks local.
+     *
+     * NOT the security gate. This reads TINA4_HOST_NAME (the configured bind
+     * address), which on a 0.0.0.0 bind looks "local" while still accepting
+     * remote clients. Trust decisions use {@see isRequestAllowed()} with the
+     * RAW socket peer instead. Kept for diagnostics / back-compat.
+     */
+    public static function isLocalhost(): bool
+    {
+        $host = DotEnv::getEnv('TINA4_HOST_NAME', 'localhost:7146') ?? 'localhost:7146';
+        $hostPart = explode(':', $host)[0];
+        return in_array($hostPart, ['localhost', '127.0.0.1', '0.0.0.0', '::1', ''], true);
+    }
+
+    /**
+     * Whether an address is a loopback (in-process / same-host) peer.
+     *
+     * Operates on the RAW socket peer, never X-Forwarded-For. Empty means an
+     * in-process / synthetic request (no socket) and is trusted. The
+     * `::ffff:` IPv4-mapped prefix is stripped. NOTE: 0.0.0.0 is a BIND
+     * address, never a client address, so it is deliberately NOT loopback.
+     *
+     * Python master parity: tina4_python.mcp.is_loopback.
+     */
+    public static function isLoopback(string $ip): bool
+    {
+        if ($ip === '') {
+            return true;
+        }
+        $ip = strtolower(trim($ip));
+        if (str_starts_with($ip, '::ffff:')) {
+            $ip = substr($ip, 7);
+        }
+        return $ip === '::1' || $ip === 'localhost' || str_starts_with($ip, '127.');
+    }
+
+    /**
+     * Capability gate — whether the MCP subsystem may run at all.
+     *
+     * Pure capability, host-INDEPENDENT (Python master parity):
+     *   - An explicit, non-empty TINA4_MCP wins: truthy → on, falsy → off.
+     *   - Otherwise MCP is a capability of any TINA4_DEBUG deployment.
+     *
+     * This NO LONGER consults the host. A debug box bound to 0.0.0.0 still
+     * "has" the capability, but {@see isRequestAllowed()} is what decides
+     * whether a given CALLER may use it — loopback always, remote only with
+     * an explicit opt-in plus a valid token. Splitting capability from
+     * per-request authorisation closes the hole where a 0.0.0.0 bind
+     * auto-exposed DB/file tools to remote unauthenticated callers.
+     */
+    public static function isEnabled(): bool
+    {
+        $explicit = DotEnv::getEnv('TINA4_MCP');
+        if ($explicit !== null && $explicit !== '') {
+            return DotEnv::isTruthy($explicit);
+        }
+        return DotEnv::isTruthy(DotEnv::getEnv('TINA4_DEBUG', 'false'));
+    }
+
+    /**
+     * Per-request authorisation — whether THIS caller may use MCP.
+     *
+     * @param string $remoteIp       Raw socket peer (Request::$remoteIp), never X-Forwarded-For.
+     * @param bool   $hasValidToken  True when the request carried a token matching TINA4_MCP_TOKEN.
+     *
+     * Rules (Python master parity, tina4_python.mcp.is_request_allowed):
+     *   - Capability off ({@see isEnabled()} false)        → deny.
+     *   - Loopback peer                                    → allow.
+     *   - Remote peer → only when TINA4_MCP_REMOTE is truthy AND a valid
+     *     token was presented. No configured token ⇒ remote can never pass.
+     */
+    public static function isRequestAllowed(string $remoteIp, bool $hasValidToken = false): bool
+    {
+        if (!self::isEnabled()) {
+            return false;
+        }
+        if (self::isLoopback($remoteIp)) {
+            return true;
+        }
+        return DotEnv::isTruthy(DotEnv::getEnv('TINA4_MCP_REMOTE')) && $hasValidToken;
+    }
+
+    /**
+     * Resolve the MCP port from TINA4_MCP_PORT — defaults to base + 2000.
+     *
+     * @param int $basePort The Tina4 HTTP port (typically 7145)
+     */
+    public static function resolvePort(int $basePort = 7145): int
+    {
+        $explicit = DotEnv::getEnv('TINA4_MCP_PORT');
+        if ($explicit !== null && $explicit !== '') {
+            return (int) $explicit;
+        }
+        return $basePort + 2000;
+    }
+
+    /**
+     * Get all registered MCP server instances.
+     *
+     * @return McpServer[]
+     */
+    public static function getInstances(): array
+    {
+        return self::$instances;
+    }
+
+    /**
+     * Clear the instance registry (for testing).
+     */
+    public static function clearInstances(): void
+    {
+        self::$instances = [];
+    }
+}
+
+// ── Built-in Dev Tools ───────────────────────────────────────────
+
+/**
+ * Register all 24 built-in dev tools on an McpServer instance.
+ *
+ * Security:
+ *     - Only active when TINA4_DEBUG=true AND running on localhost
+ *     - File operations sandboxed to project directory
+ *     - database_execute available on localhost only
+ *     - TINA4_MCP_REMOTE=true to enable on remote servers (opt-in)
+ */
+class McpDevTools
+{
+    /**
+     * Register all built-in dev tools on the given McpServer.
+     */
+    public static function register(McpServer $server): void
+    {
+        $projectRoot = realpath(getcwd()) ?: getcwd();
+
+        // ── Helpers ───────────────────────────────────────────
+
+        // Normalise a relative path safely without requiring intermediate
+        // directories to exist. Old impl used realpath() of the parent
+        // dir, which returns false when both the file AND its parent
+        // are new (e.g. `tests/foo.php` when `tests/` doesn't exist
+        // yet). The agent then sees "Path escapes project directory"
+        // for a perfectly innocent path. Walk the segments manually,
+        // resolve `..` against the segment stack, and reject only if
+        // the path actually tries to climb above the project root.
+        $safePath = function (string $relPath) use ($projectRoot): string {
+            // Strip leading slashes so absolute-looking paths can't
+            // escape; the LLM occasionally emits "/src/foo.php" by
+            // habit and we want to treat it as project-relative.
+            $clean = ltrim($relPath, "/\\");
+            $parts = preg_split('#[/\\\\]+#', $clean) ?: [];
+            $stack = [];
+            foreach ($parts as $part) {
+                if ($part === '' || $part === '.') {
+                    continue;
+                }
+                if ($part === '..') {
+                    if (empty($stack)) {
+                        throw new \RuntimeException("Path escapes project directory: $relPath");
+                    }
+                    array_pop($stack);
+                    continue;
+                }
+                $stack[] = $part;
+            }
+            $full = $projectRoot . DIRECTORY_SEPARATOR . implode(DIRECTORY_SEPARATOR, $stack);
+            // Belt-and-braces against symlink escapes: if the resolved path
+            // already exists, canonicalise it and confirm it is still inside
+            // the project root. A symlink in the tree pointing outside would
+            // otherwise let a read/write escape the sandbox even though the
+            // `..` segment guard above is clean. New paths (parent not yet
+            // created) have no realpath and rely on that segment guard. The
+            // trailing separator on both sides defeats the `/proj` vs
+            // `/proj-evil` prefix-match pitfall.
+            $real = realpath($full);
+            if ($real !== false) {
+                $rootReal = realpath($projectRoot) ?: $projectRoot;
+                $rootPrefix = rtrim($rootReal, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+                if (!str_starts_with($real . DIRECTORY_SEPARATOR, $rootPrefix)) {
+                    throw new \RuntimeException("Path escapes project directory: $relPath");
+                }
+            }
+            return $full;
+        };
+
+        $redactEnv = function (string $key, string $value): string {
+            $sensitive = ['secret', 'password', 'token', 'key', 'credential', 'api_key'];
+            foreach ($sensitive as $s) {
+                if (stripos($key, $s) !== false) {
+                    return '***REDACTED***';
+                }
+            }
+            return $value;
+        };
+
+        // ── Defensive write helpers (parity with tina4-python) ────────
+        //
+        // The supervisor occasionally feeds prose ("The plan requires…")
+        // as a path, drops bare `routes/foo.php` outside of `src/`, or
+        // overwrites a 5KB controller with a 50-byte stub. The four
+        // helpers below are the same defensive wrappers used in the
+        // Python build: log every action, refuse prose, canonicalise
+        // bare top-level dirs into `src/<dir>/`, and back up the prior
+        // content before any overwrite. Mirrors:
+        //   tina4_python/mcp/tools.py — _agent_log, _looks_like_prose,
+        //   _normalize_coder_path, _agent_backup.
+
+        $agentLog = function (string $category, string $message) use ($projectRoot): void {
+            try {
+                $logDir = $projectRoot . DIRECTORY_SEPARATOR . '.tina4';
+                if (!is_dir($logDir)) {
+                    @mkdir($logDir, 0755, true);
+                }
+                $logPath = $logDir . DIRECTORY_SEPARATOR . 'agent.log';
+                $ts = gmdate('Y-m-d\TH:i:s\Z');
+                @file_put_contents($logPath, "{$ts} [{$category}] {$message}\n", FILE_APPEND);
+            } catch (\Throwable $e) {
+                // logging must never fail the actual call
+            }
+            // Mirror to stderr so the supervisor can see it in the live log.
+            // v3.13.14 (#119, same class): STDERR isn't defined under cli-server
+            // — and a bare `STDERR` in `namespace Tina4` fatals with "Undefined
+            // constant Tina4\STDERR" (the `@` does NOT suppress that fatal in
+            // PHP 8). Use the php://stderr stream, available in every SAPI.
+            $stderr = defined('STDERR') ? \STDERR : @fopen('php://stderr', 'wb');
+            if ($stderr) {
+                @fwrite($stderr, "  [agent {$category}] {$message}\n");
+            }
+        };
+
+        // Returns an error string if the path looks like prose rather
+        // than a filesystem path, or null when the path is well-formed.
+        // PHP closures can return nullable strings via the `?string`
+        // return type — no boxing needed.
+        $looksLikeProse = function (string $relPath): ?string {
+            if ($relPath === '' || trim($relPath) === '') {
+                return 'path is empty';
+            }
+            if (strlen($relPath) > 300) {
+                return 'path too long (' . strlen($relPath) . ' chars); use a real filename';
+            }
+            $badSubstrings = ['`', "\n", "\t", '  ', ' — ', ' (', ' [', '?', '*', '<', '>', '|'];
+            foreach ($badSubstrings as $bad) {
+                if (strpos($relPath, $bad) !== false) {
+                    $rendered = json_encode($bad);
+                    return "path contains illegal character sequence {$rendered} — looks like prose, not a filename";
+                }
+            }
+            $segments = explode('/', $relPath);
+            foreach ($segments as $seg) {
+                if ($seg === '' || $seg === '.' || $seg === '..') {
+                    continue;
+                }
+                if (strlen($seg) > 80) {
+                    $preview = substr($seg, 0, 60);
+                    return "path segment too long: '{$preview}'… — use a short filename";
+                }
+                if (!preg_match('/^[A-Za-z0-9._\-]+$/', $seg)) {
+                    return "path segment '{$seg}' contains disallowed characters — stick to [A-Za-z0-9._-]";
+                }
+            }
+            return null;
+        };
+
+        // Rewrite bare top-level Tina4-conventional directories into
+        // their `src/<dir>/` canonical form. Tina4 only auto-discovers
+        // under `src/`, so a file at `templates/foo.twig` is dead
+        // weight. Logs every rewrite to `.tina4/agent.log` under
+        // `write.path_normalized`.
+        $normalizeCoderPath = function (string $relPath) use ($agentLog): string {
+            $passthroughPrefixes = ['src/', 'migrations/', 'plan/', 'tests/', 'test/', '.tina4/'];
+            $passthroughFiles = [
+                'app.py', 'app.ts', 'app.rb', 'index.php',
+                'composer.json', 'package.json', 'Gemfile',
+                'pyproject.toml', 'requirements.txt',
+                '.env', '.env.example',
+            ];
+            foreach ($passthroughPrefixes as $p) {
+                if (str_starts_with($relPath, $p)) {
+                    return $relPath;
+                }
+            }
+            if (in_array($relPath, $passthroughFiles, true)) {
+                return $relPath;
+            }
+            foreach (['routes', 'orm', 'templates', 'seeds', 'controllers', 'models', 'middleware'] as $d) {
+                if (str_starts_with($relPath, $d . '/')) {
+                    $rewritten = 'src/' . $relPath;
+                    $agentLog('write.path_normalized', "{$relPath} → {$rewritten}");
+                    return $rewritten;
+                }
+            }
+            return $relPath;
+        };
+
+        // Copy `target` into `.tina4/backups/` with a timestamped name.
+        // Returns the relative backup path on success, null on failure.
+        $agentBackup = function (string $target) use ($projectRoot, $agentLog): ?string {
+            try {
+                if (!is_file($target)) {
+                    return null;
+                }
+                $backupDir = $projectRoot . DIRECTORY_SEPARATOR . '.tina4' . DIRECTORY_SEPARATOR . 'backups';
+                if (!is_dir($backupDir)) {
+                    @mkdir($backupDir, 0755, true);
+                }
+                $rel = $target;
+                $prefix = $projectRoot . DIRECTORY_SEPARATOR;
+                if (str_starts_with($target, $prefix)) {
+                    $rel = substr($target, strlen($prefix));
+                }
+                $safe = str_replace(['/', '\\'], '__', $rel);
+                $ts = gmdate('Y-m-d\TH-i-s\Z');
+                $backupName = "{$safe}.{$ts}.bak";
+                $backupPath = $backupDir . DIRECTORY_SEPARATOR . $backupName;
+                $bytes = @file_get_contents($target);
+                if ($bytes === false) {
+                    return null;
+                }
+                if (@file_put_contents($backupPath, $bytes) === false) {
+                    return null;
+                }
+                return '.tina4/backups/' . $backupName;
+            } catch (\Throwable $e) {
+                $agentLog('write.backup_failed', "{$target}: " . $e->getMessage());
+                return null;
+            }
+        };
+
+        // Verify a freshly-written PHP file actually parses. Mirrors the
+        // Python build's `_verify_python_import()` — catches hallucinated
+        // syntax (unclosed braces, missing semicolons in function bodies,
+        // bogus `use` statements) BEFORE the next request hits a broken
+        // file and the server fataled.  Returns null on success, or the
+        // captured "Parse error: …" line on failure.
+        //
+        // Only checks files under `src/` that end in `.php`. Skips:
+        //   - bootstrap.php, index.php, app.php  (framework entry points
+        //     that load the whole world — `php -l` of a bootstrap can
+        //     succeed even when the file does nothing useful, and they
+        //     reference autoload classes that aren't visible to a
+        //     standalone lint).
+        //   - PHPUnit test files matching `*Test.php` (their parse path
+        //     pulls in TestCase which isn't autoloaded in a plain lint).
+        // Uses proc_open with a 5s timeout so we capture stdout (where
+        // PHP writes the "Parse error: …" line — yes, stdout not stderr).
+        $verifyPhpSyntax = function (string $relPath) use ($projectRoot): ?string {
+            if (!str_ends_with($relPath, '.php')) {
+                return null;
+            }
+            if (!str_starts_with($relPath, 'src/')) {
+                return null;
+            }
+            $name = basename($relPath);
+            // Framework-init files have their own loading patterns —
+            // skip them the way Python skips __init__.py / conftest.py.
+            if (in_array($name, ['bootstrap.php', 'index.php', 'app.php'], true)) {
+                return null;
+            }
+            if (str_ends_with($name, 'Test.php')) {
+                return null;
+            }
+            $absPath = $projectRoot . DIRECTORY_SEPARATOR . $relPath;
+            if (!is_file($absPath)) {
+                return null;
+            }
+            $descriptors = [
+                0 => ['pipe', 'r'],
+                1 => ['pipe', 'w'],
+                2 => ['pipe', 'w'],
+            ];
+            $cmd = ['php', '-l', $absPath];
+            $proc = @proc_open($cmd, $descriptors, $pipes, $projectRoot);
+            if (!is_resource($proc)) {
+                return null; // can't verify — skip silently
+            }
+            fclose($pipes[0]);
+            // Non-blocking reads with a 5s wall clock.
+            stream_set_blocking($pipes[1], false);
+            stream_set_blocking($pipes[2], false);
+            $stdout = '';
+            $stderr = '';
+            $deadline = microtime(true) + 5.0;
+            while (true) {
+                $status = proc_get_status($proc);
+                $stdout .= (string) stream_get_contents($pipes[1]);
+                $stderr .= (string) stream_get_contents($pipes[2]);
+                if (!$status['running']) {
+                    break;
+                }
+                if (microtime(true) > $deadline) {
+                    @proc_terminate($proc, 9);
+                    fclose($pipes[1]);
+                    fclose($pipes[2]);
+                    @proc_close($proc);
+                    return 'verification subprocess timed out after 5s';
+                }
+                usleep(20000);
+            }
+            // Final drain.
+            $stdout .= (string) stream_get_contents($pipes[1]);
+            $stderr .= (string) stream_get_contents($pipes[2]);
+            fclose($pipes[1]);
+            fclose($pipes[2]);
+            $exit = proc_close($proc);
+            if ($exit === 0) {
+                return null;
+            }
+            // PHP writes the human-readable "Parse error: …" line to
+            // STDOUT (the "PHP Parse error: …" line goes to stderr).
+            // Pull the first stdout line that starts with "Parse error:"
+            // and strip the trailing "Errors parsing …" footer.
+            $lines = preg_split('/\r\n|\n|\r/', trim($stdout)) ?: [];
+            foreach ($lines as $line) {
+                $line = trim($line);
+                if ($line === '') {
+                    continue;
+                }
+                if (str_starts_with($line, 'Parse error:') || str_starts_with($line, 'Fatal error:')) {
+                    return $line;
+                }
+            }
+            // Fallback to stderr if stdout was empty (older PHP, weird env).
+            $errLines = preg_split('/\r\n|\n|\r/', trim($stderr)) ?: [];
+            foreach ($errLines as $line) {
+                $line = trim($line);
+                if ($line !== '' && !str_starts_with($line, 'Errors parsing')) {
+                    return $line;
+                }
+            }
+            return "php -l failed (exit {$exit}, no diagnostic output)";
+        };
+
+        // ── Database Tools ────────────────────────────────────
+
+        $server->registerTool('database_query', function (string $sql, string $params = '[]') {
+            try {
+                $db = \Tina4\Database\Database::fromEnv();
+            } catch (\Throwable $e) {
+                return ['error' => 'No database connection: ' . $e->getMessage()];
+            }
+            $paramList = json_decode($params, true);
+            if (!is_array($paramList)) {
+                $paramList = [];
+            }
+            // Defense-in-depth: this tool is read-only. Strip comments, reject
+            // multiple statements, and require a leading SELECT/WITH so it can
+            // never mutate data even if reached. (database_execute is the
+            // write surface and is gated separately.) Mirrors Python master.
+            $cleaned = preg_replace('/--[^\r\n]*/', ' ', $sql);
+            $cleaned = preg_replace('#/\*.*?\*/#s', ' ', $cleaned);
+            $cleaned = trim(rtrim((string) $cleaned, "; \t\n\r"));
+            if (str_contains($cleaned, ';')) {
+                return ['error' => 'database_query rejects multiple statements'];
+            }
+            if (!preg_match('/^(select|with)\b/i', $cleaned)) {
+                return ['error' => 'database_query is read-only (SELECT/WITH only)'];
+            }
+            // BUGFIX: the old call passed `($sql, 10, 0)` — 10 landed in the
+            // $params slot (wrong type) and the bound params were dropped.
+            // Correct order is ($sql, $params, $limit, $offset).
+            try {
+                $result = $db->fetch($cleaned, $paramList, 100, 0);
+            } catch (\Throwable $e) {
+                return ['error' => $e->getMessage()];
+            }
+            return ['records' => $result ? $result->records : [], 'count' => $result ? $result->count : 0];
+        }, 'Execute a read-only SQL query (SELECT)');
+
+        $server->registerTool('database_execute', function (string $sql, string $params = '[]') {
+            try {
+                $db = \Tina4\Database\Database::fromEnv();
+            } catch (\Throwable $e) {
+                return ['error' => 'No database connection: ' . $e->getMessage()];
+            }
+            $paramList = json_decode($params, true) ?: [];
+            // execute() now RAISES on a SQL error (FAIL LOUD contract); catch it
+            // and return a clean {error} payload instead of letting it throw out
+            // of the tool handler.
+            try {
+                $db->execute($sql, $paramList);
+                $db->commit();
+            } catch (\Throwable $e) {
+                return ['error' => $e->getMessage()];
+            }
+            return ['success' => true, 'affected_rows' => 0];
+        }, 'Execute arbitrary SQL (INSERT/UPDATE/DELETE/DDL)');
+
+        $server->registerTool('database_tables', function () {
+            try {
+                $db = \Tina4\Database\Database::fromEnv();
+            } catch (\Throwable $e) {
+                return ['error' => 'No database connection: ' . $e->getMessage()];
+            }
+            return $db->getDatabase();
+        }, 'List all database tables');
+
+        $server->registerTool('database_columns', function (string $table) {
+            try {
+                $db = \Tina4\Database\Database::fromEnv();
+            } catch (\Throwable $e) {
+                return ['error' => 'No database connection: ' . $e->getMessage()];
+            }
+            // The table name is interpolated into the SQL — there is no bind
+            // slot for an identifier — so constrain it to a safe identifier
+            // (optionally schema-qualified) to keep it injection-proof.
+            if (!preg_match('/^[A-Za-z_][A-Za-z0-9_$]*(\.[A-Za-z_][A-Za-z0-9_$]*)?$/', $table)) {
+                return ['error' => 'Invalid table name'];
+            }
+            try {
+                $result = $db->fetch("SELECT * FROM $table", [], 1, 0);
+            } catch (\Throwable $e) {
+                return ['error' => $e->getMessage()];
+            }
+            if ($result && !empty($result->records)) {
+                return array_keys($result->records[0]);
+            }
+            return [];
+        }, 'Get column definitions for a table');
+
+        // ── Route Tools ───────────────────────────────────────
+
+        $server->registerTool('route_list', function () {
+            $routes = [];
+            $reflection = new \ReflectionClass(Router::class);
+            $prop = $reflection->getProperty('routes');
+            // ReflectionProperty::setAccessible() is deprecated in PHP 8.5
+            // (no-op since 8.1 — getValue() handles private properties
+            // directly). Drop the call to silence the warning.
+            $allRoutes = $prop->getValue();
+            foreach ($allRoutes as $method => $methodRoutes) {
+                foreach ($methodRoutes as $route) {
+                    $routes[] = [
+                        'method' => $method,
+                        'path' => $route['pattern'] ?? '',
+                        'auth_required' => !($route['noAuth'] ?? false),
+                    ];
+                }
+            }
+            return $routes;
+        }, 'List all registered routes');
+
+        $server->registerTool('route_test', function (string $method, string $path, string $body = '', string $headers = '{}') {
+            // Simple route testing via internal dispatch
+            return ['info' => "Route test for $method $path - use the built-in test client"];
+        }, 'Call a route and return the response');
+
+        $server->registerTool('swagger_spec', function () {
+            try {
+                return Swagger::generate();
+            } catch (\Throwable $e) {
+                return ['error' => $e->getMessage()];
+            }
+        }, 'Return the OpenAPI 3.0.3 JSON spec');
+
+        // ── Template Tools ────────────────────────────────────
+
+        $server->registerTool('template_render', function (string $template, string $data = '{}') {
+            try {
+                $engine = new Frond('src/templates');
+                $ctx = json_decode($data, true) ?: [];
+                return $engine->renderString($template, $ctx);
+            } catch (\Throwable $e) {
+                return ['error' => $e->getMessage()];
+            }
+        }, 'Render a template string with data');
+
+        // ── File Tools ────────────────────────────────────────
+
+        $server->registerTool('file_read', function (string $path) use ($safePath) {
+            $p = $safePath($path);
+            if (!file_exists($p)) {
+                return "File not found: $path";
+            }
+            if (!is_file($p)) {
+                return "Not a file: $path";
+            }
+            return file_get_contents($p);
+        }, 'Read a project file');
+
+        $server->registerTool('file_write', function (string $path, string $content) use ($safePath, $projectRoot, $looksLikeProse, $normalizeCoderPath, $agentBackup, $agentLog, $verifyPhpSyntax) {
+            // 1. Reject prose-as-path BEFORE any normalisation or
+            //    resolution — the path-escape guard inside $safePath
+            //    only catches `..` climbs, not sentence-as-filename.
+            $proseErr = $looksLikeProse($path);
+            if ($proseErr !== null) {
+                $msg = "Invalid path '{$path}': {$proseErr}";
+                $agentLog('write.refused', $msg);
+                return ['error' => $msg, 'refused' => true];
+            }
+            // 2. Canonicalise `routes/foo.php` → `src/routes/foo.php`
+            //    so the truncation guard and backup see the same path
+            //    the file will actually land at.
+            $path = $normalizeCoderPath($path);
+            $p = $safePath($path);
+            // 3. Compute old/new size + line counts for the truncation
+            //    guard and audit log.
+            $oldBytes = is_file($p) ? (@file_get_contents($p) ?: '') : '';
+            $oldSize = strlen($oldBytes);
+            $oldLines = substr_count($oldBytes, "\n");
+            $newSize = strlen($content);
+            $newLines = substr_count($content, "\n");
+            $relPath = str_replace($projectRoot . DIRECTORY_SEPARATOR, '', $p);
+
+            // 4. Truncation guard — refuse suspicious shrinkage on
+            //    non-trivial files. Mirrors Python's:
+            //      old_size > 200 and (new_size*100) < (old_size*30)
+            if ($oldSize > 200 && ($newSize * 100) < ($oldSize * 30)) {
+                $msg = "REFUSED {$relPath} (would shrink {$oldSize} → {$newSize} bytes / " .
+                    "{$oldLines} → {$newLines} lines, looks truncated)";
+                $agentLog('write.refused', $msg);
+                return [
+                    'error' => $msg,
+                    'refused' => true,
+                    'old_bytes' => $oldSize,
+                    'new_bytes' => $newSize,
+                ];
+            }
+
+            // 5. Backup before overwrite — only if there's prior content.
+            $backupRel = $oldSize > 0 ? $agentBackup($p) : null;
+
+            $dir = dirname($p);
+            if (!is_dir($dir)) {
+                mkdir($dir, 0755, true);
+            }
+            if (file_put_contents($p, $content) === false) {
+                $agentLog('write.failed', "{$relPath}: file_put_contents returned false");
+                return ['error' => "Could not write {$relPath}"];
+            }
+
+            // 6. Audit log.
+            $backupNote = $backupRel ?: '(no prior file)';
+            $agentLog('write.ok', "{$relPath} ({$oldSize}B/{$oldLines}L → {$newSize}B/{$newLines}L, backup: {$backupNote})");
+
+            $result = ['written' => $relPath, 'bytes' => $newSize];
+            if ($backupRel) {
+                $result['backup'] = $backupRel;
+            }
+
+            // 7. Post-write syntax check — only matters for .php files
+            //    under src/. Surface the parse error in the tool result
+            //    so the LLM sees it on its next turn, AND log to agent.log
+            //    so the supervisor can trace broken writes.
+            $importErr = $verifyPhpSyntax($relPath);
+            if ($importErr !== null) {
+                $result['import_error'] = $importErr;
+                $agentLog('write.import_failed', "{$relPath}: {$importErr}");
+            }
+            return $result;
+        }, 'Write or update a project file');
+
+        // file_patch — targeted replace. The supervisor's system prompt
+        // mandates this as the primary edit tool ("Never reach for
+        // file_write when file_patch can do the job"), so any framework
+        // that doesn't register it makes the LLM's first edit attempt
+        // fail with "Unknown tool: file_patch". Mirrors the Python
+        // implementation byte-for-byte, including the count guard that
+        // rejects ambiguous matches before they corrupt the file.
+        $server->registerTool('file_patch', function (string $path, string $old_string, string $new_string, int $count = 1) use ($safePath, $projectRoot, $looksLikeProse, $normalizeCoderPath, $agentBackup, $agentLog, $verifyPhpSyntax) {
+            // Same defensive ordering as file_write: prose-check first
+            // so the early failure mode is consistent across both tools.
+            $proseErr = $looksLikeProse($path);
+            if ($proseErr !== null) {
+                $msg = "Invalid path '{$path}': {$proseErr}";
+                $agentLog('patch.refused', $msg);
+                return ['error' => $msg, 'refused' => true];
+            }
+            $path = $normalizeCoderPath($path);
+            $p = $safePath($path);
+            if (!file_exists($p) || !is_file($p)) {
+                return ['error' => "File not found: $path"];
+            }
+            $original = file_get_contents($p);
+            if ($original === false) {
+                return ['error' => "Could not read $path"];
+            }
+            $occurrences = substr_count($original, $old_string);
+            if ($occurrences === 0) {
+                return ['error' => "old_string not found in $path"];
+            }
+            if ($occurrences !== $count) {
+                return [
+                    'error' => "old_string appears {$occurrences} times, expected {$count}. " .
+                        'Expand old_string to make it unique, or set count explicitly.',
+                ];
+            }
+            // PHP's str_replace replaces all matches; we already verified
+            // the count matches, so a single bulk replace is correct.
+            $updated = str_replace($old_string, $new_string, $original);
+
+            // Backup before overwrite — same path as file_write so
+            // recovery is uniform regardless of which tool touched the file.
+            $backupRel = $agentBackup($p);
+
+            if (file_put_contents($p, $updated) === false) {
+                $agentLog('patch.failed', "{$path}: file_put_contents returned false");
+                return ['error' => "Could not write $path"];
+            }
+            $relPath = str_replace($projectRoot . DIRECTORY_SEPARATOR, '', $p);
+            $oldSize = strlen($original);
+            $newSize = strlen($updated);
+            $backupNote = $backupRel ?: '(none)';
+            $agentLog('patch.ok', "{$relPath} (replaced {$count}× old_string, {$oldSize}B → {$newSize}B, backup: {$backupNote})");
+            $result = [
+                'patched' => $relPath,
+                'replacements' => $count,
+                'bytes' => $newSize,
+            ];
+            if ($backupRel) {
+                $result['backup'] = $backupRel;
+            }
+
+            // Post-patch syntax check — same defensive net as file_write.
+            // A bad str_replace can leave a PHP file with a dangling
+            // brace or unterminated string; surface it inline so the
+            // LLM doesn't have to wait for a 500 to find out.
+            $importErr = $verifyPhpSyntax($relPath);
+            if ($importErr !== null) {
+                $result['import_error'] = $importErr;
+                $agentLog('patch.import_failed', "{$relPath}: {$importErr}");
+            }
+            return $result;
+        }, 'Targeted edit: replace old_string with new_string in a file');
+
+        $server->registerTool('file_list', function (string $path = '.') use ($safePath) {
+            $p = $safePath($path);
+            if (!file_exists($p)) {
+                return ['error' => "Directory not found: $path"];
+            }
+            if (!is_dir($p)) {
+                return ['error' => "Not a directory: $path"];
+            }
+            $entries = [];
+            $items = scandir($p);
+            sort($items);
+            foreach ($items as $item) {
+                if ($item === '.' || $item === '..') {
+                    continue;
+                }
+                $fullPath = $p . DIRECTORY_SEPARATOR . $item;
+                $entries[] = [
+                    'name' => $item,
+                    'type' => is_dir($fullPath) ? 'dir' : 'file',
+                    'size' => is_file($fullPath) ? filesize($fullPath) : 0,
+                ];
+            }
+            return $entries;
+        }, 'List files in a directory');
+
+        $server->registerTool('asset_upload', function (string $filename, string $content, string $encoding = 'utf-8') use ($safePath, $projectRoot) {
+            $target = $safePath("src/public/$filename");
+            $dir = dirname($target);
+            if (!is_dir($dir)) {
+                mkdir($dir, 0755, true);
+            }
+            if ($encoding === 'base64') {
+                file_put_contents($target, base64_decode($content));
+            } else {
+                file_put_contents($target, $content);
+            }
+            $relPath = str_replace($projectRoot . DIRECTORY_SEPARATOR, '', $target);
+            return ['uploaded' => $relPath, 'bytes' => filesize($target)];
+        }, 'Upload a file to src/public/');
+
+        // ── Migration Tools ───────────────────────────────────
+
+        $server->registerTool('migration_status', function () {
+            try {
+                $migration = new Migration();
+                return ['info' => 'Migration system available'];
+            } catch (\Throwable $e) {
+                return ['error' => $e->getMessage()];
+            }
+        }, 'List pending and completed migrations');
+
+        $server->registerTool('migration_create', function (string $description) {
+            try {
+                $migration = new Migration();
+                // Create migration file
+                $migrationPath = 'migrations';
+                if (!is_dir($migrationPath)) {
+                    mkdir($migrationPath, 0755, true);
+                }
+                $existing = glob($migrationPath . '/*.sql');
+                $nextId = str_pad(count($existing) + 1, 6, '0', STR_PAD_LEFT);
+                $safeName = preg_replace('/[^a-z0-9]+/', '_', strtolower($description));
+                $filename = "{$nextId}_{$safeName}.sql";
+                file_put_contents($migrationPath . '/' . $filename, "-- $description\n");
+                return ['created' => $filename];
+            } catch (\Throwable $e) {
+                return ['error' => $e->getMessage()];
+            }
+        }, 'Create a new migration file');
+
+        $server->registerTool('migration_run', function () {
+            try {
+                $migration = new Migration();
+                $result = $migration->doMigration();
+                return ['result' => $result];
+            } catch (\Throwable $e) {
+                return ['error' => $e->getMessage()];
+            }
+        }, 'Run all pending migrations');
+
+        // ── Queue Tools ───────────────────────────────────────
+
+        $server->registerTool('queue_status', function (string $topic = 'default') {
+            try {
+                $queue = new Queue($topic);
+                return [
+                    'topic' => $topic,
+                    'pending' => $queue->size('pending'),
+                    'completed' => $queue->size('completed'),
+                    'failed' => $queue->size('failed'),
+                ];
+            } catch (\Throwable $e) {
+                return ['error' => $e->getMessage()];
+            }
+        }, 'Get queue size by status');
+
+        // ── Session/Cache Tools ───────────────────────────────
+
+        $server->registerTool('session_list', function () {
+            $sessionDir = 'data/sessions';
+            if (!is_dir($sessionDir)) {
+                return [];
+            }
+            $sessions = [];
+            foreach (glob($sessionDir . '/*.json') as $f) {
+                $id = pathinfo($f, PATHINFO_FILENAME);
+                $contents = file_get_contents($f);
+                $data = json_decode($contents, true);
+                if ($data !== null) {
+                    $sessions[] = ['id' => $id, 'data' => $data];
+                } else {
+                    $sessions[] = ['id' => $id, 'error' => 'corrupt'];
+                }
+            }
+            return $sessions;
+        }, 'List active sessions');
+
+        $server->registerTool('cache_stats', function () {
+            try {
+                return \Tina4\Middleware\ResponseCache::cacheStats();
+            } catch (\Throwable $e) {
+                return ['error' => $e->getMessage()];
+            }
+        }, 'Get response cache statistics');
+
+        // ── ORM Tools ─────────────────────────────────────────
+
+        $server->registerTool('orm_describe', function () {
+            // Scan src/orm/ for ORM subclasses
+            $models = [];
+            $ormDir = 'src/orm';
+            if (is_dir($ormDir)) {
+                foreach (glob($ormDir . '/*.php') as $file) {
+                    $className = pathinfo($file, PATHINFO_FILENAME);
+                    if (class_exists($className) && is_subclass_of($className, ORM::class)) {
+                        $instance = new $className();
+                        $models[] = [
+                            'class' => $className,
+                            'table' => $instance->tableName ?? strtolower($className),
+                            'primaryKey' => $instance->primaryKey ?? 'id',
+                        ];
+                    }
+                }
+            }
+            return $models;
+        }, 'List all ORM models with fields and types');
+
+        // ── Debugging Tools ───────────────────────────────────
+
+        $server->registerTool('log_tail', function (int $lines = 50) {
+            $logFile = 'logs/debug.log';
+            if (!file_exists($logFile)) {
+                return [];
+            }
+            $allLines = file($logFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+            return array_slice($allLines, -$lines);
+        }, 'Read recent log entries');
+
+        $server->registerTool('error_log', function (int $limit = 20) {
+            // Check for stored errors
+            return [];
+        }, 'Recent errors and exceptions');
+
+        $server->registerTool('env_list', function () use ($redactEnv) {
+            $envVars = getenv();
+            if (!is_array($envVars)) {
+                $envVars = [];
+            }
+            ksort($envVars);
+            $result = [];
+            foreach ($envVars as $k => $v) {
+                $result[$k] = $redactEnv($k, (string)$v);
+            }
+            return $result;
+        }, 'List environment variables (secrets redacted)');
+
+        // ── Data Tools ────────────────────────────────────────
+
+        $server->registerTool('seed_table', function (string $table, int $count = 10) {
+            try {
+                $db = \Tina4\Database\Database::fromEnv();
+                $fake = new FakeData();
+                // Basic seeding - get table columns and generate data
+                return ['table' => $table, 'info' => "Seed $count rows - use FakeData class"];
+            } catch (\Throwable $e) {
+                return ['error' => $e->getMessage()];
+            }
+        }, 'Seed a table with fake data');
+
+        // ── System Tools ──────────────────────────────────────
+
+        $server->registerTool('system_info', function () use ($projectRoot) {
+            return [
+                'framework' => 'tina4-php',
+                'version' => App::$VERSION,
+                'php' => PHP_VERSION,
+                'platform' => PHP_OS,
+                'cwd' => $projectRoot,
+                'debug' => getenv('TINA4_DEBUG') ?: 'false',
+            ];
+        }, 'Framework version, PHP version, project info');
+
+        // ── Plan management ──────────────────────────────────────
+        //
+        // 9 tools — Python-parity, shared storage format with
+        // tina4_python.dev_admin.plan. The dev-admin UI "Plans" panel
+        // calls these via MCP; without them the whole feature is dead.
+
+        $server->registerTool('plan_current', function () {
+            return Plan::current();
+        }, 'Active plan: title, steps (done/not), next step, progress');
+
+        $server->registerTool('plan_list', function () {
+            return Plan::listPlans();
+        }, 'All plans in plan/ with progress and which one is active');
+
+        $server->registerTool('plan_create', function (string $title, string $goal = '', array $steps = [], bool $make_current = true) {
+            return Plan::create($title, $goal, $steps, $make_current);
+        }, 'Create a new markdown plan in plan/ and make it active');
+
+        $server->registerTool('plan_switch_to', function (string $name) {
+            return Plan::setCurrent($name);
+        }, 'Make a different plan the active one');
+
+        $server->registerTool('plan_complete_step', function (int $index) {
+            return Plan::completeStep($index);
+        }, 'Tick a step as done (call the moment the step finishes)');
+
+        $server->registerTool('plan_add_step', function (string $text) {
+            return Plan::addStep($text);
+        }, 'Append a new unchecked step to the current plan');
+
+        $server->registerTool('plan_note', function (string $text) {
+            return Plan::appendNote($text);
+        }, 'Append a timestamped note/breadcrumb to the current plan');
+
+        $server->registerTool('plan_archive', function (string $name = '') {
+            return Plan::archive($name);
+        }, 'Move a finished plan to plan/done/ and clear the current pointer');
+
+        $server->registerTool('plan_read', function (string $name) {
+            return Plan::read($name);
+        }, 'Full structured view of any plan by filename');
+
+        $server->registerTool('plan_flesh', function (string $name = '', string $prompt = '') {
+            return Plan::flesh($name, $prompt);
+        }, 'Auto-generate concrete build steps via qwen and append them to an existing plan — use when a plan has a title/goal but no steps yet');
+
+        // ── Framework docs (Tina4 knowledge base) ────────────────
+        //
+        // Let the AI look up first-party framework documentation on
+        // demand instead of guessing from training data. Reads the
+        // markdown bundled with the tina4-php repo — answers match the
+        // exact framework version the project is using.
+
+        $frameworkDocs = function (): array {
+            // Framework docs live at the package root (composer vendor
+            // dir or repo root when developing locally).
+            $candidates = [];
+            try {
+                $ref = new \ReflectionClass(App::class);
+                $pkgRoot = dirname((string) $ref->getFileName(), 2); // Tina4/App.php → repo root
+                $candidates = [
+                    $pkgRoot . '/CLAUDE.md',
+                    $pkgRoot . '/AGENTS.md',
+                    $pkgRoot . '/CONVENTIONS.md',
+                    $pkgRoot . '/README.md',
+                ];
+            } catch (\Throwable) {
+            }
+            $out = [];
+            foreach ($candidates as $c) {
+                if (is_file($c)) {
+                    $out[] = $c;
+                }
+            }
+            return $out;
+        };
+
+        $server->registerTool('docs_list', function () use ($frameworkDocs) {
+            $out = [];
+            foreach ($frameworkDocs() as $p) {
+                $out[] = ['name' => basename($p), 'bytes' => filesize($p) ?: 0];
+            }
+            return $out;
+        }, 'List framework documentation files');
+
+        $server->registerTool('docs_search', function (string $query, int $limit = 5, int $context_lines = 4) use ($frameworkDocs) {
+            if (strlen($query) < 2) {
+                return ['error' => 'query must be at least 2 characters'];
+            }
+            $needle = strtolower($query);
+            $hits = [];
+            foreach ($frameworkDocs() as $p) {
+                $text = (string) @file_get_contents($p);
+                $lines = preg_split("/\r\n|\n|\r/", $text) ?: [];
+                foreach ($lines as $i => $line) {
+                    if (str_contains(strtolower($line), $needle)) {
+                        $start = max(0, $i - $context_lines);
+                        $end = min(count($lines), $i + $context_lines + 1);
+                        $snippet = implode("\n", array_slice($lines, $start, $end - $start));
+                        $score = 1;
+                        if (str_contains($line, $query)) $score++;
+                        if (str_starts_with(ltrim($line), '#')) $score += 2;
+                        $hits[] = [
+                            'file' => basename($p),
+                            'line' => $i + 1,
+                            'score' => $score,
+                            'snippet' => $snippet,
+                        ];
+                    }
+                }
+            }
+            usort($hits, fn($a, $b) => $b['score'] - $a['score']);
+            return array_slice($hits, 0, max(1, $limit));
+        }, 'Search Tina4 framework docs for a query string (use before guessing)');
+
+        $server->registerTool('docs_section', function (string $file, string $heading) use ($frameworkDocs) {
+            $match = null;
+            foreach ($frameworkDocs() as $p) {
+                if (basename($p) === $file) {
+                    $match = $p;
+                    break;
+                }
+            }
+            if ($match === null) {
+                return ['error' => "Unknown doc file: {$file}. Try docs_list() first."];
+            }
+            $text = (string) file_get_contents($match);
+            $lines = preg_split("/\r\n|\n|\r/", $text) ?: [];
+            $headingLc = strtolower(trim($heading));
+            $start = -1;
+            $startLevel = 0;
+            foreach ($lines as $i => $line) {
+                $stripped = ltrim($line);
+                if (str_starts_with($stripped, '#')) {
+                    $level = strlen($stripped) - strlen(ltrim($stripped, '#'));
+                    $title = strtolower(trim(substr($stripped, $level)));
+                    if (str_contains($title, $headingLc)) {
+                        $start = $i;
+                        $startLevel = $level;
+                        break;
+                    }
+                }
+            }
+            if ($start < 0) {
+                return ['error' => "Heading '{$heading}' not found in {$file}"];
+            }
+            $end = count($lines);
+            for ($j = $start + 1; $j < count($lines); $j++) {
+                $stripped = ltrim($lines[$j]);
+                if (str_starts_with($stripped, '#')) {
+                    $level = strlen($stripped) - strlen(ltrim($stripped, '#'));
+                    if ($level <= $startLevel) {
+                        $end = $j;
+                        break;
+                    }
+                }
+            }
+            return [
+                'file' => $file,
+                'heading' => trim($lines[$start]),
+                'body' => implode("\n", array_slice($lines, $start, $end - $start)),
+            ];
+        }, 'Return a full markdown section from a framework doc file');
+
+        // ── Live API RAG (per plan/v3/22-LIVE-API-RAG.md) ──
+        // Distinct from docs_* (which searches prose markdown).
+        // api_* tools query the live framework reflection — actual
+        // class/method signatures, file/line locations, source
+        // tagging (framework vs user). Use api_* for "what's the
+        // signature of X?" and docs_* for "explain queues conceptually".
+        $server->registerTool('api_search', function (string $query, int $k = 5, string $source = 'all', bool $include_private = false) use ($projectRoot) {
+            $docs = new Docs($projectRoot);
+            return $docs->search($query, $k, $source, $include_private);
+        }, 'Live API search — finds framework + user classes/methods by name/summary. Use BEFORE guessing a method exists.');
+
+        $server->registerTool('api_class', function (string $name) use ($projectRoot) {
+            $docs = new Docs($projectRoot);
+            $spec = $docs->classSpec($name);
+            return $spec ?? ['error' => "class not found: {$name}"];
+        }, 'Live class reflection — returns full method list + signatures for an FQN.');
+
+        $server->registerTool('api_method', function (string $class, string $name) use ($projectRoot) {
+            $docs = new Docs($projectRoot);
+            $spec = $docs->methodSpec($class, $name);
+            return $spec ?? ['error' => "method not found: {$class}::{$name}"];
+        }, 'Live method reflection — returns signature, params, return type, file, line.');
+
+        // ── Project introspection ────────────────────────────────
+
+        $server->registerTool('git_status', function () use ($projectRoot) {
+            $cmd = function (array $args) use ($projectRoot): string {
+                $full = 'cd ' . escapeshellarg($projectRoot) . ' && git ' . implode(' ', array_map('escapeshellarg', $args)) . ' 2>&1';
+                $out = shell_exec($full);
+                return trim($out ?? '');
+            };
+            $inside = shell_exec('cd ' . escapeshellarg($projectRoot) . ' && git rev-parse --is-inside-work-tree 2>/dev/null');
+            if (!$inside || trim($inside) !== 'true') {
+                return ['error' => 'Not a git repository'];
+            }
+            $status = $cmd(['status', '--porcelain']);
+            $lines = $status === '' ? [] : preg_split("/\r?\n/", $status);
+            $commits = $cmd(['log', '--oneline', '-5']);
+            return [
+                'branch' => $cmd(['branch', '--show-current']),
+                'status' => $lines,
+                'recent_commits' => $commits === '' ? [] : preg_split("/\r?\n/", $commits),
+            ];
+        }, 'Show git branch, modified/untracked files, recent commits');
+
+        $server->registerTool('deps_list', function () use ($projectRoot) {
+            $composer = $projectRoot . '/composer.json';
+            if (!is_file($composer)) {
+                return ['error' => 'No composer.json at project root'];
+            }
+            $data = json_decode((string) file_get_contents($composer), true);
+            if (!is_array($data)) {
+                return ['error' => 'Failed to parse composer.json'];
+            }
+            return [
+                'name' => $data['name'] ?? '',
+                'version' => $data['version'] ?? '',
+                'require' => $data['require'] ?? [],
+                'require_dev' => $data['require-dev'] ?? [],
+                'php' => $data['require']['php'] ?? '',
+            ];
+        }, "List this project's declared PHP dependencies");
+
+        $server->registerTool('project_overview', function () use ($server) {
+            // One-shot snapshot: system + deps + routes + models + tables +
+            // errors + git. Calls other registered tools internally so
+            // drift between /overview and individual tools is impossible.
+            $out = [];
+            $safe = function (string $tool) use ($server, &$out) {
+                try {
+                    $out[] = [$tool, $server->callTool($tool, [])];
+                } catch (\Throwable $e) {
+                    $out[] = [$tool, ['error' => $e->getMessage()]];
+                }
+            };
+            $safe('system_info');
+            $safe('deps_list');
+            $safe('route_list');
+            $safe('orm_describe');
+            $safe('database_tables');
+            $safe('git_status');
+            $overview = [];
+            foreach ($out as [$k, $v]) {
+                $overview[$k] = $v;
+            }
+            return $overview;
+        }, 'One-shot snapshot: system, deps, routes, models, tables, git');
+
+        // ── Project index — "where is what" map ──────────────────
+        //
+        // 4 tools backed by ProjectIndex (.tina4/project_index.json).
+        // Zero deps: PHP symbol extraction via token_get_all(), all other
+        // languages via regex.
+
+        $server->registerTool('index_rebuild', function () {
+            return ProjectIndex::refresh();
+        }, 'Refresh the persistent project index (lazy, mtime-based)');
+
+        $server->registerTool('index_search', function (string $query, int $limit = 20) {
+            return ProjectIndex::search($query, $limit);
+        }, "Find files by path, symbol, route, or summary — use FIRST for 'where is X'");
+
+        $server->registerTool('index_file', function (string $path) {
+            return ProjectIndex::fileEntry($path);
+        }, 'Full index entry for one file: symbols, routes, imports');
+
+        $server->registerTool('index_overview', function () {
+            return ProjectIndex::overview();
+        }, 'Project shape: files by language, routes, models, recent edits');
+
+        // ── Migration status (was stubbed) ───────────────────────
+        // Replace the earlier `migration_status` stub with a real check.
+        $server->registerTool('migration_status', function () use ($projectRoot) {
+            $dir = $projectRoot . '/migrations';
+            if (!is_dir($dir)) {
+                return ['pending' => [], 'completed' => [], 'note' => 'no migrations/ dir'];
+            }
+            $files = glob($dir . '/*.sql') ?: [];
+            sort($files);
+            $names = array_map('basename', $files);
+            return [
+                'count' => count($names),
+                'files' => $names,
+                'note' => 'Run `php bin/tina4php migrate` to apply pending migrations.',
+            ];
+        }, 'List pending and completed migrations');
+    }
+}
+
+// ── Functional decorator helpers (parity with Python/Ruby/Node) ──
+
+/**
+ * Register a callable as an MCP tool on a server (or the default server).
+ *
+ * Usage:
+ *     mcp_tool("lookup_invoice", "Find invoice by number")(function(string $invoiceNo): array {
+ *         return $db->fetchOne("SELECT * FROM invoices WHERE invoice_no = ?", [$invoiceNo]);
+ *     });
+ *
+ * @param string          $name        Tool name
+ * @param string          $description Human-readable description
+ * @param McpServer|null  $server      Target server (null = default)
+ * @return callable Decorator that accepts the handler callable
+ */
+function mcp_tool(string $name = '', string $description = '', ?McpServer $server = null): callable
+{
+    return function (callable $handler) use ($name, $description, $server): callable {
+        $toolName = $name ?: (is_array($handler) ? $handler[1] : 'tool');
+        $target = $server ?? McpServer::getDefaultServer();
+        $target->registerTool($toolName, $handler, $description);
+        return $handler;
+    };
+}
+
+/**
+ * Register a callable as an MCP resource on a server (or the default server).
+ *
+ * Usage:
+ *     mcp_resource("app://schema", "Database schema")(function() use ($db) {
+ *         return $db->getDatabase();
+ *     });
+ *
+ * @param string          $uri         Resource URI
+ * @param string          $description Human-readable description
+ * @param string          $mimeType    MIME type (default application/json)
+ * @param McpServer|null  $server      Target server (null = default)
+ * @return callable Decorator that accepts the handler callable
+ */
+function mcp_resource(string $uri, string $description = '', string $mimeType = 'application/json', ?McpServer $server = null): callable
+{
+    return function (callable $handler) use ($uri, $description, $mimeType, $server): callable {
+        $target = $server ?? McpServer::getDefaultServer();
+        $target->registerResource($uri, $handler, $description, $mimeType);
+        return $handler;
+    };
+}

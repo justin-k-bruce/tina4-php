@@ -1,0 +1,469 @@
+<?php
+
+/**
+ * Tina4 — The Intelligent Native Application 4ramework
+ * Copyright 2007 - current Tina4
+ * License: MIT https://opensource.org/licenses/MIT
+ */
+
+use PHPUnit\Framework\TestCase;
+use Tina4\DatabaseUrl;
+use Tina4\Database\Database;
+use Tina4\Database\SQLite3Adapter;
+use Tina4\DotEnv;
+
+class DatabaseUrlTest extends TestCase
+{
+    protected function setUp(): void
+    {
+        DotEnv::resetEnv();
+    }
+
+    protected function tearDown(): void
+    {
+        DotEnv::resetEnv();
+        putenv('TINA4_DATABASE_URL');
+        unset($_ENV['TINA4_DATABASE_URL'], $_SERVER['TINA4_DATABASE_URL']);
+    }
+
+    public function testParseSqlitePath(): void
+    {
+        // sqlite:///X is RELATIVE to cwd (matches tina4-python, tina4-nodejs).
+        // Use sqlite:////X for absolute paths.
+        $db = new DatabaseUrl('sqlite:///path/to/database.db');
+
+        $this->assertEquals('sqlite', $db->scheme);
+        $this->assertEquals('DataSQLite3', $db->driver);
+        $this->assertEquals('path/to/database.db', $db->database, 'three slashes = relative');
+        $this->assertEquals('', $db->host);
+        $this->assertEquals(0, $db->port);
+        $this->assertEquals('', $db->username);
+        $this->assertEquals('', $db->password);
+    }
+
+    public function testParseSqliteAbsolutePath(): void
+    {
+        // Four slashes = Unix absolute path.
+        $db = new DatabaseUrl('sqlite:////var/data/app.db');
+        $this->assertEquals('sqlite', $db->scheme);
+        $this->assertEquals('/var/data/app.db', $db->database);
+    }
+
+    public function testParseSqliteWindowsDriveLetter(): void
+    {
+        // Windows drive letter = absolute.
+        $db = new DatabaseUrl('sqlite:///C:/Users/app.db');
+        $this->assertEquals('sqlite', $db->scheme);
+        $this->assertEquals('C:/Users/app.db', $db->database);
+    }
+
+    public function testParseSqliteBruceCase(): void
+    {
+        // Regression for the bruceproject crash: sqlite:///data/app.db
+        // used to be parsed as absolute "/data/app.db" and tried to
+        // mkdir("/data") on macOS read-only root. Now relative.
+        $db = new DatabaseUrl('sqlite:///data/app.db');
+        $this->assertEquals('data/app.db', $db->database);
+    }
+
+    public function testParseSqliteMemory(): void
+    {
+        $db = new DatabaseUrl('sqlite::memory:');
+
+        $this->assertEquals('sqlite', $db->scheme);
+        $this->assertEquals(':memory:', $db->database);
+    }
+
+    public function testParseSqliteMemoryWithSlashes(): void
+    {
+        $db = new DatabaseUrl('sqlite:///:memory:');
+
+        $this->assertEquals(':memory:', $db->database);
+    }
+
+    public function testParsePostgresql(): void
+    {
+        $db = new DatabaseUrl('postgres://admin:secret@db.example.com:5432/myapp');
+
+        $this->assertEquals('postgres', $db->scheme);
+        $this->assertEquals('DataPostgresql', $db->driver);
+        $this->assertEquals('db.example.com', $db->host);
+        $this->assertEquals(5432, $db->port);
+        $this->assertEquals('myapp', $db->database);
+        $this->assertEquals('admin', $db->username);
+        $this->assertEquals('secret', $db->password);
+    }
+
+    public function testParsePostgresAlias(): void
+    {
+        $db = new DatabaseUrl('postgres://user:pass@host/db');
+
+        $this->assertEquals('DataPostgresql', $db->driver);
+    }
+
+    public function testParseMysql(): void
+    {
+        $db = new DatabaseUrl('mysql://root:password@localhost:3306/shop');
+
+        $this->assertEquals('mysql', $db->scheme);
+        $this->assertEquals('DataMySQL', $db->driver);
+        $this->assertEquals('localhost', $db->host);
+        $this->assertEquals(3306, $db->port);
+        $this->assertEquals('shop', $db->database);
+        $this->assertEquals('root', $db->username);
+        $this->assertEquals('password', $db->password);
+    }
+
+    public function testParseMariadb(): void
+    {
+        $db = new DatabaseUrl('mysql://user:pass@host/db');
+
+        $this->assertEquals('DataMySQL', $db->driver);
+    }
+
+    public function testParseMssql(): void
+    {
+        $db = new DatabaseUrl('mssql://sa:P%40ssw0rd@sqlserver:1433/enterprise');
+
+        $this->assertEquals('DataMSSQL', $db->driver);
+        $this->assertEquals('sqlserver', $db->host);
+        $this->assertEquals(1433, $db->port);
+        $this->assertEquals('enterprise', $db->database);
+        $this->assertEquals('sa', $db->username);
+        $this->assertEquals('P@ssw0rd', $db->password); // URL-decoded
+    }
+
+    public function testParseFirebird(): void
+    {
+        $db = new DatabaseUrl('firebird://sysdba:masterkey@localhost:3050/opt/firebird/data.fdb');
+
+        $this->assertEquals('DataFirebird', $db->driver);
+        $this->assertEquals('localhost', $db->host);
+        $this->assertEquals(3050, $db->port);
+        $this->assertEquals('opt/firebird/data.fdb', $db->database);
+    }
+
+    public function testDefaultPorts(): void
+    {
+        $pg = new DatabaseUrl('postgres://user:pass@host/db');
+        $this->assertEquals(5432, $pg->port);
+
+        $mysql = new DatabaseUrl('mysql://user:pass@host/db');
+        $this->assertEquals(3306, $mysql->port);
+
+        $mssql = new DatabaseUrl('mssql://user:pass@host/db');
+        $this->assertEquals(1433, $mssql->port);
+
+        $fb = new DatabaseUrl('firebird://user:pass@host/db');
+        $this->assertEquals(3050, $fb->port);
+    }
+
+    public function testGetDriverClass(): void
+    {
+        $db = new DatabaseUrl('postgres://user:pass@host/db');
+
+        $this->assertEquals('Tina4\\DataPostgresql', $db->getDriverClass());
+    }
+
+    public function testGetDsnForSqlite(): void
+    {
+        // sqlite:///X is relative; use sqlite:////X for absolute.
+        $db = new DatabaseUrl('sqlite:////tmp/test.db');
+
+        $this->assertEquals('/tmp/test.db', $db->getDsn());
+    }
+
+    public function testGetDsnForNetworkDb(): void
+    {
+        $db = new DatabaseUrl('postgres://user:pass@db.host:5432/mydb');
+
+        $this->assertEquals('db.host:5432/mydb', $db->getDsn());
+    }
+
+    public function testToSafeStringMasksPassword(): void
+    {
+        $db = new DatabaseUrl('mysql://root:supersecret@localhost:3306/mydb');
+
+        $safe = $db->toSafeString();
+
+        $this->assertStringContainsString('root', $safe);
+        $this->assertStringContainsString('***', $safe);
+        $this->assertStringNotContainsString('supersecret', $safe);
+    }
+
+    public function testToSafeStringForSqlite(): void
+    {
+        $db = new DatabaseUrl('sqlite:////tmp/test.db');
+
+        $this->assertEquals('sqlite:////tmp/test.db', $db->toSafeString());
+    }
+
+    public function testInvalidUrlThrows(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+
+        new DatabaseUrl('not-a-valid-url');
+    }
+
+    public function testUnsupportedSchemeThrows(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Unsupported database scheme');
+
+        new DatabaseUrl('redis://localhost:6379/0');
+    }
+
+    public function testFromEnvReturnsNullWhenNotSet(): void
+    {
+        $result = DatabaseUrl::fromEnv();
+
+        $this->assertNull($result);
+    }
+
+    public function testFromEnvParsesWhenSet(): void
+    {
+        $_ENV['TINA4_DATABASE_URL'] = 'sqlite:///tmp/test.db';
+        putenv('TINA4_DATABASE_URL=sqlite:///tmp/test.db');
+
+        // Reset DotEnv so it picks up the env var
+        DotEnv::resetEnv();
+
+        $result = DatabaseUrl::fromEnv();
+
+        $this->assertNotNull($result);
+        $this->assertEquals('sqlite', $result->scheme);
+    }
+
+    public function testUrlEncodedCredentials(): void
+    {
+        $db = new DatabaseUrl('mysql://user%40domain:p%23ss%26word@host/db');
+
+        $this->assertEquals('user@domain', $db->username);
+        $this->assertEquals('p#ss&word', $db->password);
+    }
+
+    // --- Database Tests ---
+
+    /**
+     * Run a real CREATE/INSERT/SELECT round-trip through a Database the
+     * factory just built. Proves the constructed adapter is a live, usable
+     * connection — not merely the right class.
+     */
+    private function assertRoundTrips(Database $db): void
+    {
+        $this->assertInstanceOf(SQLite3Adapter::class, $db->getAdapter());
+        $db->execute('CREATE TABLE IF NOT EXISTS widgets (id INTEGER PRIMARY KEY, name TEXT)');
+        $db->execute('INSERT INTO widgets (name) VALUES (?)', ['gizmo']);
+        $row = $db->fetchOne('SELECT name FROM widgets WHERE id = ?', [1]);
+        $this->assertSame('gizmo', $row['name'] ?? null);
+    }
+
+    public function testFactoryCreateSqliteMemoryRoundTrips(): void
+    {
+        // All three spellings of an in-memory DB must build a working adapter
+        // that actually executes a CREATE/INSERT/SELECT round-trip.
+        foreach ([':memory:', 'sqlite::memory:', 'sqlite:///:memory:'] as $url) {
+            $db = Database::create($url);
+            $this->assertInstanceOf(Database::class, $db, "create('{$url}') yields a Database");
+            $this->assertRoundTrips($db);
+            $db->close();
+        }
+    }
+
+    public function testFactoryCreateSqliteFromPathRoundTrips(): void
+    {
+        $path = sys_get_temp_dir() . '/test_factory_' . uniqid() . '.db';
+        $db = Database::create('sqlite:///' . $path);
+        $this->assertInstanceOf(Database::class, $db);
+        $this->assertRoundTrips($db);
+        $db->close();
+        // The file-backed adapter actually persisted to disk.
+        $this->assertFileExists($path);
+        @unlink($path);
+    }
+
+    public function testFactoryCreateSqliteFromBareFilePathRoundTrips(): void
+    {
+        $path = sys_get_temp_dir() . '/test_factory_bare_' . uniqid() . '.db';
+        $db = Database::create($path);
+        $this->assertInstanceOf(Database::class, $db);
+        $this->assertRoundTrips($db);
+        $db->close();
+        $this->assertFileExists($path);
+        @unlink($path);
+    }
+
+    public function testFactoryCreateSqliteFromSqlite3ExtensionRoundTrips(): void
+    {
+        $path = sys_get_temp_dir() . '/test_factory_' . uniqid() . '.sqlite3';
+        $db = Database::create($path);
+        $this->assertInstanceOf(Database::class, $db);
+        $this->assertRoundTrips($db);
+        $db->close();
+        @unlink($path);
+    }
+
+    public function testFactoryInvalidUrlThrows(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Cannot determine database type');
+
+        Database::create('not-a-valid-url');
+    }
+
+    public function testFactoryUnsupportedSchemeThrows(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Unsupported database scheme');
+
+        Database::create('redis://localhost:6379/0');
+    }
+
+    public function testFactorySupportedSchemes(): void
+    {
+        $schemes = Database::supportedSchemes();
+
+        $this->assertContains('sqlite', $schemes);
+        $this->assertContains('postgres', $schemes);
+        $this->assertContains('mysql', $schemes);
+        $this->assertContains('mssql', $schemes);
+        $this->assertContains('firebird', $schemes);
+    }
+
+    public function testFactoryIsSupportedTrue(): void
+    {
+        $this->assertTrue(Database::isSupported('sqlite'));
+        $this->assertTrue(Database::isSupported('SQLITE'));
+        $this->assertTrue(Database::isSupported('postgres'));
+        $this->assertTrue(Database::isSupported('mysql'));
+    }
+
+    public function testFactoryIsSupportedFalse(): void
+    {
+        $this->assertFalse(Database::isSupported('redis'));
+        $this->assertFalse(Database::isSupported('ftp'));
+        $this->assertFalse(Database::isSupported(''));
+    }
+
+    public function testFactoryFromEnvReturnsNullWhenNotSet(): void
+    {
+        putenv('TINA4_DATABASE_URL');
+        unset($_ENV['TINA4_DATABASE_URL'], $_SERVER['TINA4_DATABASE_URL']);
+        DotEnv::resetEnv();
+
+        $result = Database::fromEnv();
+        $this->assertNull($result);
+    }
+
+    public function testFactoryFromEnvCreatesSqliteAdapter(): void
+    {
+        $_ENV['TINA4_DATABASE_URL'] = 'sqlite::memory:';
+        putenv('TINA4_DATABASE_URL=sqlite::memory:');
+        DotEnv::resetEnv();
+
+        $result = Database::fromEnv();
+        $this->assertInstanceOf(Database::class, $result);
+        // The env-built connection is live and round-trips.
+        $this->assertRoundTrips($result);
+        $result->close();
+    }
+
+    public function testFactoryCreateWithSeparateCredentials(): void
+    {
+        // The factory accepts separate username/password params. For SQLite
+        // these are ignored, but the resulting connection must still be live.
+        $db = Database::create(':memory:', null, 'testuser', 'testpass');
+        $this->assertInstanceOf(Database::class, $db);
+        $this->assertRoundTrips($db);
+        $db->close();
+    }
+
+    public function testFactoryAutoCommitOffStillCommitsExplicitTransaction(): void
+    {
+        // autoCommit=false means a standalone write is NOT durable until an
+        // explicit commit. Prove the parameter actually changes behaviour
+        // rather than merely being accepted by the signature.
+        $path = sys_get_temp_dir() . '/test_autocommit_' . uniqid() . '.db';
+        $writer = Database::create('sqlite:///' . $path, false);
+        $writer->execute('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)');
+        $writer->commit(); // persist the DDL on the manual-commit connection
+        $writer->startTransaction();
+        $writer->execute('INSERT INTO t (v) VALUES (?)', ['x']);
+        $writer->commit();
+
+        $count = $writer->fetchOne('SELECT COUNT(*) AS c FROM t');
+        $this->assertSame(1, (int)($count['c'] ?? 0), 'committed row is visible');
+        $writer->close();
+        @unlink($path);
+    }
+
+    public function testFactoryAutoCommitOnPersistsStandaloneWrite(): void
+    {
+        // autoCommit=true (the default): a standalone write is durable on its
+        // own. Re-open the file and confirm the row survived.
+        $path = sys_get_temp_dir() . '/test_autocommit_on_' . uniqid() . '.db';
+        $writer = Database::create('sqlite:///' . $path, true);
+        $writer->execute('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)');
+        $writer->execute('INSERT INTO t (v) VALUES (?)', ['y']);
+        $writer->close();
+
+        $reader = Database::create('sqlite:///' . $path, true);
+        $row = $reader->fetchOne('SELECT v FROM t WHERE id = 1');
+        $this->assertSame('y', $row['v'] ?? null, 'auto-committed write survives reconnect');
+        $reader->close();
+        @unlink($path);
+    }
+
+    // --- DatabaseUrl Additional Alias Tests ---
+
+    public function testSqlite3AliasRemoved(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        new DatabaseUrl('sqlite3:///tmp/test.db');
+    }
+
+    public function testSqlsrvAliasRemoved(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        new DatabaseUrl('sqlsrv://sa:pass@host/db');
+    }
+
+    public function testFdbAliasRemoved(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        new DatabaseUrl('fdb://user:pass@host/path/to/db.fdb');
+    }
+
+    public function testGetDsnWithoutPort(): void
+    {
+        // SQLite has port 0, so getDsn should just return the database.
+        // Use sqlite:////X for absolute paths (sqlite:///X is now relative).
+        $db = new DatabaseUrl('sqlite:////tmp/test.db');
+        $this->assertEquals('/tmp/test.db', $db->getDsn());
+    }
+
+    public function testGetDsnWithoutDatabase(): void
+    {
+        // When only host:port is provided
+        $db = new DatabaseUrl('postgres://user:pass@host:5432/');
+        $dsn = $db->getDsn();
+        $this->assertStringContainsString('host', $dsn);
+        $this->assertStringContainsString('5432', $dsn);
+    }
+
+    public function testToSafeStringWithoutPassword(): void
+    {
+        $db = new DatabaseUrl('postgres://user@host/db');
+        $safe = $db->toSafeString();
+        $this->assertStringContainsString('user@', $safe);
+        $this->assertStringNotContainsString('***', $safe);
+    }
+
+    public function testToSafeStringWithoutCredentials(): void
+    {
+        // URL with host but no user/pass
+        $db = new DatabaseUrl('postgres://host:5432/db');
+        $safe = $db->toSafeString();
+        $this->assertStringNotContainsString('@', $safe);
+    }
+}

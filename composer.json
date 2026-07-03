@@ -1,87 +1,53 @@
 {
     "name": "tina4stack/tina4php",
-    "description": "Tina4 PHP",
+    "description": "Tina4 for PHP \u2014 54 built-in features, zero dependencies",
     "license": "MIT",
     "autoload": {
-        "files": [
-            "Tina4/Functions.php",
-            "Tina4/Initialize.php"
-        ],
-        "classmap": [
-            "Helpers/",
-            "Tina4/",
-            "src/"
-        ],
         "psr-4": {
-            "\\": [
-                "src",
-                "src/app",
-                "src/orm",
-                "src/routes",
-                "Helpers/"
-            ],
-            "Tina4\\": [
-                "Tina4/",
-                "Tina4/Api/",
-                "Tina4/Config/",
-                "Tina4/Database/",
-                "Tina4/Deploy",
-                "Tina4/Messaging/",
-                "Tina4/Routing/",
-                "Tina4/Security/",
-                "Tina4/Service/",
-                "Tina4/Slack",
-                "Tina4/Twig"
-            ]
-        }
+            "Tina4\\": "Tina4/",
+            "Tina4\\Cache\\": "Tina4/Cache/",
+            "Tina4\\Database\\": "Tina4/Database/",
+            "Tina4\\Middleware\\": "Tina4/Middleware/",
+            "Tina4\\Queue\\": "Tina4/Queue/",
+            "Tina4\\Session\\": "Tina4/Session/"
+        },
+        "files": [
+            "Tina4/Constants.php",
+            "Tina4/MCP.php",
+            "Tina4/Middleware/CacheFunctions.php",
+            "Tina4/WebSocketBackplane.php",
+            "Tina4/DocStore.php"
+        ]
     },
     "require": {
-        "psr/log": "^1.1.4",
-        "nowakowskir/php-jwt": "^2.0.1",
-        "twig/twig": "^3.3.8",
-        "phpfastcache/phpfastcache": "^8.0.5",
-        "coyl/git": "^0.1.7",
-        "scssphp/scssphp": "^1.5.2",
-        "tina4stack/tina4php-debug": "^2.0",
-        "tina4stack/tina4php-shape": "^2.0",
-        "tina4stack/tina4php-env": "^2.0",
-        "tina4stack/tina4php-database": "^2.0",
-        "tina4stack/tina4php-orm": "^2.0",
+        "php": ">=8.2",
         "ext-openssl": "*",
-        "ext-libxml": "*",
-        "ext-json": "*",
-        "ext-curl": "*",
-        "ext-fileinfo": "*",
-        "tina4stack/tina4php-core": "^2.0"
+        "ext-json": "*"
     },
     "scripts": {
-        "tina4": "@php bin/tina4",
-        "tina4-debug": "@php -dxdebug.mode=debug -dxdebug.client_host=host.docker.internal -dxdebug.client_port=9004 -dxdebug.start_with_request=yes bin/tina4",
-        "tina4service": "tina4service",
-        "test": "@tina4 tests:run",
-        "phplint": "vendor/bin/phplint",
-        "watcher": "vendor/bin/php-watcher",
-        "test:verbose": "@tina4 tests:verbose",
-        "initialize": "@tina4 initialize:run",
-        "initialise": "@tina4 initialize:run",
-        "debug": "@tina4-debug webservice:run",
-        "begin": "@tina4 initialize:run",
-        "start": "@tina4 webservice:run",
-        "start-service": "@tina4service",
-        "run-tests": "./vendor/bin/phpunit tests --color --log-junit=tests/junit.xml -v",
-        "phpmetrics": "./vendor/bin/phpmetrics --report-html=phpmetrics --junit=tests/junit.xml ./Tina4",
-        "lint": "@phplint --exclude=vendor"
+        "serve": "@php bin/tina4php serve",
+        "start": "@php bin/tina4php serve",
+        "test": "./vendor/bin/phpunit tests --color",
+        "lint": "vendor/bin/phplint --exclude=vendor"
     },
     "config": {
         "process-timeout": 0
     },
     "require-dev": {
-        "roave/security-advisories": "dev-latest",
-        "phpunit/phpunit": "^9",
-        "overtrue/phplint": "^2.0",
-        "tina4stack/tina4php-sqlite3": "^2.0",
-        "phpmetrics/phpmetrics": "^2.8",
-        "tina4stack/tina4php-reports": "dev-main",
-        "tina4stack/tina4-documentation": "dev-main"
+        "phpunit/phpunit": "^10 || ^11",
+        "mongodb/mongodb": "^2.3"
+    },
+    "bin": [
+        "bin/tina4php"
+    ],
+    "suggest": {
+        "ext-sqlite3": "Required for SQLite3 database support",
+        "ext-pdo": "Required for MySQL/PostgreSQL/MSSQL database support",
+        "ext-pgsql": "Required for PostgreSQL database support",
+        "ext-mongodb": "Required for the MongoDB queue/session/doc-store backends",
+        "mongodb/mongodb": "High-level MongoDB library used by the Mongo queue/session/doc-store backends",
+        "ext-curl": "Required for external API calls",
+        "ext-fileinfo": "Required for file type detection",
+        "ext-zip": "Required for ZIP file handling"
     }
 }

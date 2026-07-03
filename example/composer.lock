@@ -1,0 +1,84 @@
+{
+    "_readme": [
+        "This file locks the dependencies of your project to a known state",
+        "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
+        "This file is @generated automatically"
+    ],
+    "content-hash": "ec12eebd457279df34e3d4a55c9967eb",
+    "packages": [
+        {
+            "name": "tina4stack/tina4php",
+            "version": "3.x-dev",
+            "dist": {
+                "type": "path",
+                "url": "..",
+                "reference": "d9f4da83669f4c2be5550f2d99f4c265772a9e07"
+            },
+            "require": {
+                "ext-json": "*",
+                "ext-openssl": "*",
+                "php": ">=8.2"
+            },
+            "require-dev": {
+                "phpunit/phpunit": "^10 || ^11"
+            },
+            "suggest": {
+                "ext-curl": "Required for external API calls",
+                "ext-fileinfo": "Required for file type detection",
+                "ext-pdo": "Required for MySQL/PostgreSQL/MSSQL database support",
+                "ext-sqlite3": "Required for SQLite3 database support",
+                "ext-zip": "Required for ZIP file handling"
+            },
+            "bin": [
+                "bin/tina4php"
+            ],
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "Tina4\\": "Tina4/",
+                    "Tina4\\Database\\": "Tina4/Database/",
+                    "Tina4\\Middleware\\": "Tina4/Middleware/",
+                    "Tina4\\Queue\\": "Tina4/Queue/",
+                    "Tina4\\Session\\": "Tina4/Session/"
+                },
+                "files": [
+                    "Tina4/Constants.php",
+                    "Tina4/MCP.php"
+                ]
+            },
+            "scripts": {
+                "serve": [
+                    "@php bin/tina4php serve"
+                ],
+                "start": [
+                    "@php bin/tina4php serve"
+                ],
+                "test": [
+                    "./vendor/bin/phpunit tests --color"
+                ],
+                "lint": [
+                    "vendor/bin/phplint --exclude=vendor"
+                ]
+            },
+            "license": [
+                "MIT"
+            ],
+            "description": "Tina4 for PHP — 54 built-in features, zero dependencies",
+            "transport-options": {
+                "symlink": true,
+                "relative": true
+            }
+        }
+    ],
+    "packages-dev": [],
+    "aliases": [],
+    "minimum-stability": "stable",
+    "stability-flags": {
+        "tina4stack/tina4php": 20
+    },
+    "prefer-stable": false,
+    "prefer-lowest": false,
+    "platform": {},
+    "platform-dev": {},
+    "plugin-api-version": "2.9.0"
+}
